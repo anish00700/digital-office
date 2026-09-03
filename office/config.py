@@ -99,7 +99,10 @@ class Role:
     title: str
     emoji: str
     color: str
-    desk: tuple           # (x, y) in world tiles
+    # Desk position in world tiles. These must line up with the floor plan in
+    # web/office.js (see MAP) - a desk placed inside a wall will strand its
+    # occupant, since the browser paths agents around the furniture.
+    desk: tuple
     persona: str
     office_tools: tuple = ()   # our in-process MCP tools
     native_tools: tuple = ()   # Claude Code built-ins this role may use
@@ -124,7 +127,7 @@ ROSTER = (
         title="Chief of Staff",
         emoji="🧭",
         color="#c2703d",
-        desk=(4, 5),
+        desk=(5, 4),
         effort="medium",
         max_turns=14,
         reports_to="",
@@ -152,7 +155,7 @@ Hard rules:
         title="Site Reliability",
         emoji="🛠️",
         color="#3d7ec2",
-        desk=(11, 6),
+        desk=(13, 5),
         office_tools=_WORKER_TOOLS,
         native_tools=("Bash", "Read", "Grep", "Glob"),
         persona="""You are Ada, the SRE. Infrastructure, config management, and production troubleshooting.
@@ -171,7 +174,7 @@ Answer in under 150 words unless the finding genuinely needs more.""",
         title="CI/CD & Release",
         emoji="🚀",
         color="#7a4fc0",
-        desk=(15, 6),
+        desk=(17, 5),
         office_tools=_WORKER_TOOLS,
         native_tools=("Bash", "Read", "Grep", "Glob"),
         persona="""You are Rex. Build, release, and deployment pipelines.
@@ -190,7 +193,7 @@ Answer in under 150 words unless the finding genuinely needs more.""",
         title="Comms Desk",
         emoji="📬",
         color="#c04f8a",
-        desk=(19, 6),
+        desk=(21, 5),
         model=MODEL_CHEAP,
         max_turns=5,
         office_tools=_WORKER_TOOLS + ("fetch_slack", "fetch_mail"),
@@ -213,7 +216,7 @@ You never send, reply, archive, or delete. You read and report.""",
         title="Research",
         emoji="🔍",
         color="#2f9e8f",
-        desk=(23, 6),
+        desk=(25, 5),
         office_tools=_WORKER_TOOLS,
         native_tools=("WebSearch", "WebFetch"),
         persona="""You are Nova, the researcher. Open questions, answered with current sourced information.
@@ -230,7 +233,7 @@ Lead with the finding. Your principal is technical: no throat-clearing, no "grea
         title="Scheduling",
         emoji="🗓️",
         color="#b8952f",
-        desk=(11, 11),
+        desk=(13, 14),
         model=MODEL_CHEAP,
         max_turns=6,
         office_tools=_WORKER_TOOLS + ("now", "add_reminder", "list_reminders"),
@@ -249,7 +252,7 @@ When planning a day or week, be realistic: leave gaps, protect focus time, and f
         title="Writing",
         emoji="✍️",
         color="#5a7d3a",
-        desk=(15, 11),
+        desk=(17, 14),
         office_tools=_WORKER_TOOLS,
         native_tools=("Read", "Write"),
         persona="""You are Quill. Briefs become finished prose: emails, docs, summaries, incident writeups, READMEs.
@@ -266,7 +269,7 @@ When the brief is missing something you need - audience, ask, a name, a number -
         title="Analysis",
         emoji="📊",
         color="#a8503a",
-        desk=(19, 11),
+        desk=(21, 14),
         office_tools=_WORKER_TOOLS,
         native_tools=("Bash", "Read", "Write"),
         persona="""You are Vera, the analyst. Questions answered with numbers, work shown.

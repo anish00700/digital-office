@@ -79,6 +79,48 @@ interchangeable behind one interface in `office/llm.py`.
 > developer — eight looping agents will exhaust them and the office will stall
 > until the window resets. The `api` backend is the supported path.
 
+## Life on the floor
+
+The office is drawn as pixel art and the staff actually walk around it. Three
+things happen on their own:
+
+- **Coffee breaks.** Idle too long and someone wanders off to the break room,
+  stands around with a cup, and comes back. At most a third of the staff can be
+  away at once — the whole floor emptying reads as a fire drill, not a break.
+  Work arriving cuts a break short immediately.
+- **The manager walks the floor.** When Miles has nothing to do he gets up,
+  visits three desks, asks how it's going, and gets a variously honest answer.
+- **Being called in.** When a task *actually fails*, that agent is summoned to
+  the manager's office, told off, and sent back to their desk. The reason quoted
+  is the real error from the real failure — this is driven by task outcomes, not
+  a random timer.
+
+All of it is real events on the bus, so every viewer sees the same thing at the
+same moment and the office feed records it. None of it costs a token: the dialogue
+is canned, because paying a model to generate "how's it coming?" would be an
+absurd way to spend your balance.
+
+Movement is pathfound (breadth-first over a walkability grid), so agents route
+through doors rather than through walls. If you leave the tab hidden, the browser
+throttles animation; on return, everyone snaps to where the story says they
+should be instead of crawling through a backlog.
+
+Tune the pacing — useful for a demo, since the defaults are calm:
+
+```bash
+OFFICE_BACKEND=mock OFFICE_SOCIAL_IDLE=10 OFFICE_PATROL_MIN=35 \
+OFFICE_PATROL_MAX=60 OFFICE_MOCK_FAILURE_RATE=0.4 ./officectl run
+```
+
+`OFFICE_MOCK_FAILURE_RATE` makes mock tasks fail on purpose. Without failures you
+never see the manager's office get used, which is half the point of a free demo.
+
+> The floor plan lives in `MAP` at the top of `web/office.js`; desk coordinates
+> live in `ROSTER` in `office/config.py`. They must agree — a desk placed inside
+> a wall strands its occupant. To check after moving anything, open the console
+> and confirm every seat can still reach `SCOLD_SPOT` and `BREAK_SPOTS[0]` via
+> `findPath`.
+
 ## Token economy
 
 Cost control is designed in, not bolted on. Every measure below is active by
@@ -214,3 +256,9 @@ deploy/          systemd unit, nginx config, env template
 | `OFFICE_MAX_TOOL_RESULT` | `4000` | tool output truncation |
 | `OFFICE_APPROVAL_TIMEOUT` | `900` | seconds before an agent gives up |
 | `OFFICE_DATA_DIR` / `OFFICE_WORKSPACE` | `./data` / `./workspace` | paths |
+| `OFFICE_SOCIAL_IDLE` | `100` | idle seconds before someone wants coffee |
+| `OFFICE_BREAK_CHANCE` | `0.35` | odds an eligible agent takes a break |
+| `OFFICE_BREAK_MIN` / `_MAX` | `25` / `55` | break length, seconds |
+| `OFFICE_PATROL_MIN` / `_MAX` | `150` / `320` | seconds between manager patrols |
+| `OFFICE_SOCIAL_TICK` | `12` | how often the social ticker looks around |
+| `OFFICE_MOCK_FAILURE_RATE` | `0.18` | mock-only: share of tasks that fail |

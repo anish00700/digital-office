@@ -123,6 +123,9 @@ body {
   width: 100%;
   display: block;
   cursor: default;
+  /* Keep the pixel art crisp when the browser scales the backing store. */
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
 }
 
 .composer {
@@ -207,6 +210,7 @@ body {
 .line.thinking { color: var(--ink-dim); font-style: italic; }
 .line.error { color: var(--bad); }
 .line.user { color: var(--accent); }
+.line.social { color: #a294c4; font-style: italic; }
 
 .agentCard { padding: 14px 16px 4px; }
 .agentCard .name { font-size: 17px; font-weight: 650; }

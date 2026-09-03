@@ -11,6 +11,7 @@ import time
 
 from . import config, llm, tools
 from .bus import EventBus
+from .social import SocialLife
 from .store import Store
 
 log = logging.getLogger("office")
@@ -68,6 +69,7 @@ class Office:
         self._approval_waiters = {}
         self._workers = []
         self._paused_reason = ""
+        self.social = SocialLife(self)
 
     # -- lifecycle ------------------------------------------------------
     async def start(self):
@@ -79,6 +81,7 @@ class Office:
         self._workers = [
             asyncio.create_task(self._manager_loop(), name="manager"),
             asyncio.create_task(self._ticker(), name="ticker"),
+            asyncio.create_task(self.social.run(), name="social"),
         ]
         for rid in config.STAFF_IDS:
             self._workers.append(
@@ -191,6 +194,7 @@ class Office:
                                        finished_at=time.time())
                 self.bus.publish("task.updated", agent_id=agent_id, task_id=task_id,
                                  status="failed")
+                self._on_failure(agent_id, task_id, str(exc))
             finally:
                 event = self._task_events.get(task_id)
                 if event is not None:
@@ -237,6 +241,8 @@ class Office:
                                error=turn.error or None, finished_at=time.time())
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
                          status=status, result=result[:400])
+        if status == "failed":
+            self._on_failure(role.id, task_id, turn.error)
 
     async def _manager_loop(self):
         role = config.role(config.MANAGER_ID)
@@ -289,6 +295,12 @@ class Office:
         self.store.set_agent(agent_id, status, detail, task_id)
         self.bus.publish("agent.status", agent_id=agent_id, status=status,
                          detail=detail, task_id=task_id)
+        self.social.note_status(agent_id, status)
+
+    def _on_failure(self, agent_id, task_id, error):
+        """A failed task earns a trip to the manager's office. Fire and forget -
+        the telling-off must never delay or block real work."""
+        asyncio.create_task(self.social.on_task_failed(agent_id, task_id, error))
 
     def _record_usage(self, role, turn):
         self.store.add_usage_row(role.id, role.model_id, turn)

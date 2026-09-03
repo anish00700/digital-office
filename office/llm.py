@@ -391,6 +391,19 @@ def _estimate_cost(model, turn):
 class MockBackend:
     name = "mock"
 
+    # Some tasks fail on purpose. Without failures you never see the approval
+    # queue or the manager's office get used, which is half the point of a
+    # free demo mode. Set to 0 for a suspiciously harmonious workplace.
+    FAILURE_RATE = float(os.environ.get("OFFICE_MOCK_FAILURE_RATE", "0.18"))
+
+    EXCUSES = (
+        "connection refused talking to the staging host",
+        "the playbook referenced an inventory group that no longer exists",
+        "no credentials for that cluster",
+        "the build log was rotated before I could read it",
+        "ran out of turns before reaching a conclusion",
+    )
+
     def describe_auth(self):
         return "none (mock)"
 
@@ -400,16 +413,18 @@ class MockBackend:
         await asyncio.sleep(random.uniform(0.6, 1.6))
 
         if req.agent_id == config.MANAGER_ID:
-            text = await self._mock_manager(req, ctx, on_event)
+            turn.text = await self._mock_manager(req, ctx, on_event)
         else:
             names = [s.name for s in req.tools if s.read_only] or None
             if names:
-                pick = random.choice(names)
-                on_event("tool", tool=pick, args="")
+                on_event("tool", tool=random.choice(names), args="")
                 await asyncio.sleep(random.uniform(0.4, 1.0))
-            text = (f"[mock] {config.role(req.agent_id).name} handled: "
-                    f"{truncate(req.prompt, 160)}")
-        turn.text = text
+            if random.random() < self.FAILURE_RATE:
+                turn.error = random.choice(self.EXCUSES)
+                on_event("error", text=turn.error)
+            else:
+                turn.text = (f"[mock] {config.role(req.agent_id).name} handled: "
+                             f"{truncate(req.prompt, 160)}")
         turn.input_tokens = random.randint(400, 900)
         turn.output_tokens = random.randint(80, 260)
         return turn
