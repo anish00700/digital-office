@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Control script for the Digital Office daemon.
+#
+#   ./officectl start     background, survives your terminal
+#   ./officectl run       foreground, for watching logs while you develop
+#   ./officectl stop
+#   ./officectl status
+#   ./officectl logs      tail -f
+#   ./officectl setup     create the venv and install dependencies
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+VENV=".venv"
+PY="$VENV/bin/python"
+PID="data/office.pid"
+LOG="data/office.log"
+
+# Python 3.10+ is required by claude-agent-sdk. macOS system python is 3.9.
+pick_python() {
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then
+        echo "$candidate"; return 0
+      fi
+    fi
+  done
+  echo "no python >= 3.10 found on PATH" >&2
+  return 1
+}
+
+setup() {
+  local py; py="$(pick_python)"
+  echo "using $py ($("$py" -V))"
+  [ -d "$VENV" ] || "$py" -m venv "$VENV"
+  "$PY" -m pip install --quiet --upgrade pip
+  "$PY" -m pip install --quiet -r requirements.txt
+  mkdir -p data workspace
+  echo "ready. now run: ./officectl start"
+}
+
+running() {
+  [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null
+}
+
+case "${1:-}" in
+  setup) setup ;;
+
+  run)
+    [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
+    exec "$PY" -m office.daemon "${@:2}"
+    ;;
+
+  start)
+    [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
+    if running; then echo "already running (pid $(cat "$PID"))"; exit 0; fi
+    mkdir -p data
+    nohup "$PY" -m office.daemon >>"$LOG" 2>&1 &
+    sleep 1.5
+    if running; then
+      echo "office open at http://${OFFICE_HOST:-127.0.0.1}:${OFFICE_PORT:-8765} (pid $(cat "$PID"))"
+    else
+      echo "failed to start; last lines of $LOG:" >&2
+      tail -n 20 "$LOG" >&2
+      exit 1
+    fi
+    ;;
+
+  stop)
+    if running; then
+      kill "$(cat "$PID")"
+      for _ in $(seq 20); do running || break; sleep 0.25; done
+      running && kill -9 "$(cat "$PID")" 2>/dev/null || true
+      rm -f "$PID"
+      echo "closed"
+    else
+      echo "not running"
+    fi
+    ;;
+
+  restart) "$0" stop; "$0" start ;;
+
+  status)
+    if running; then
+      echo "running (pid $(cat "$PID"))"
+      curl -fsS "http://${OFFICE_HOST:-127.0.0.1}:${OFFICE_PORT:-8765}/api/health" \
+        && echo || echo "(http not answering)"
+    else
+      echo "stopped"
+    fi
+    ;;
+
+  logs) tail -f "$LOG" ;;
+
+  *)
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

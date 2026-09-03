@@ -1,0 +1,33 @@
+# Reverse proxy for the Digital Office. The SSE stream needs buffering off and
+# a long read timeout, otherwise the GUI drops its connection every 60s.
+
+server {
+    listen 443 ssl http2;
+    server_name office.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/office.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/office.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Server-sent events: no buffering, no early timeout.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        chunked_transfer_encoding off;
+    }
+}
+
+server {
+    listen 80;
+    server_name office.example.com;
+    return 301 https://$host$request_uri;
+}

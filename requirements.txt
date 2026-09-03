@@ -1,0 +1,5 @@
+# Default backend. Bundles its own Claude Code binary - no Node install needed.
+claude-agent-sdk>=0.1.0
+
+# Only needed for OFFICE_BACKEND=api. Harmless to leave installed.
+anthropic>=0.40.0

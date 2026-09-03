@@ -1,0 +1,40 @@
+# systemd unit for a Linux VPS behind a reverse proxy.
+#
+#   sudo cp deploy/digital-office.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now digital-office
+#
+# Edit User, WorkingDirectory and the EnvironmentFile path to match your host.
+# Secrets belong in the environment file (chmod 600), never in this unit.
+
+[Unit]
+Description=Digital Office - Claude agent staff
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=office
+Group=office
+WorkingDirectory=/opt/digital-office
+EnvironmentFile=/etc/digital-office.env
+ExecStart=/opt/digital-office/.venv/bin/python -m office.daemon
+Restart=always
+RestartSec=5
+
+# The office runs shell commands on your behalf. Keep it fenced in.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/digital-office/data /opt/digital-office/workspace
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=append:/opt/digital-office/data/office.log
+StandardError=append:/opt/digital-office/data/office.log
+
+[Install]
+WantedBy=multi-user.target

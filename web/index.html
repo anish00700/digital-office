@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital Office</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏢</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="logo">🏢</span> Digital Office</div>
+  <div class="stat" id="conn"><span class="dot"></span><span id="connText">connecting</span></div>
+  <div class="stat" title="Time the daemon has been running">⏱ <span id="uptime">–</span></div>
+  <div class="stat" title="Spend in the last 24h against your daily cap">
+    💸 <span id="spend">–</span>
+  </div>
+  <div class="stat" id="backendStat" title="Active LLM backend">⚙ <span id="backend">–</span></div>
+  <div class="spacer"></div>
+  <button id="approvalsBtn" class="pill hidden">⚠ <span id="approvalsCount">0</span> waiting on you</button>
+</header>
+
+<main class="layout">
+
+  <aside class="panel tasks">
+    <h2>Task board</h2>
+    <div class="board" id="board"></div>
+  </aside>
+
+  <section class="stage">
+    <canvas id="floor"></canvas>
+    <div class="composer">
+      <input id="msg" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Ask Miles for something — he'll delegate it…">
+      <button id="send">Send</button>
+    </div>
+  </section>
+
+  <aside class="panel inspector">
+    <div id="inspectorHead">
+      <h2>Office feed</h2>
+      <p class="muted">Click anyone on the floor to watch them work.</p>
+    </div>
+    <div class="feed" id="feed"></div>
+  </aside>
+
+</main>
+
+<div class="modal hidden" id="modal">
+  <div class="sheet">
+    <div class="sheetHead">
+      <h2>Waiting on you</h2>
+      <button id="modalClose" class="ghost">Close</button>
+    </div>
+    <div id="approvals"></div>
+  </div>
+</div>
+
+<div class="tooltip hidden" id="tip"></div>
+
+<script src="/static/office.js"></script>
+</body>
+</html>
