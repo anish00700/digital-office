@@ -4,3 +4,6 @@ workspace/
 __pycache__/
 *.pyc
 .env
+
+# Personal Claude Code config - machine-specific, keep it local
+.claude/settings.local.json
