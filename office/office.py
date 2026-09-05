@@ -9,7 +9,7 @@ import contextlib
 import logging
 import time
 
-from . import config, llm, roster, tools
+from . import config, llm, notebook, roster, tools
 from .bus import EventBus
 from .social import SocialLife
 from .store import Store
@@ -347,10 +347,12 @@ class Office:
         ctx = AgentContext(self, role.id, task_id, task["title"])
         request = llm.RunRequest(
             agent_id=role.id,
-            system=config.fill(role.persona, self.principal()),
+            system=(config.fill(role.persona, self.principal())
+                    + notebook.lesson_block(self.store, role.id)),
             prompt=task["brief"],
             tools=tools.specs_for(role),
             native_tools=role.native_tools,
+            skills=role.skills,
             model=role.model_id,
             effort=role.effort,
             max_turns=role.max_turns,
@@ -362,6 +364,13 @@ class Office:
 
         result = ctx.result or turn.text or "(no output)"
         status = "failed" if turn.error else "done"
+        # The office records what happened itself. Paying an agent to summarise
+        # what the database already knows would be an absurd way to spend a turn.
+        with contextlib.suppress(Exception):
+            notebook.log_activity(
+                self.store,
+                f"**{role.name}** {status} — {ctx.task_title}"
+                + (f" ({turn.error.splitlines()[0][:70]})" if turn.error else ""))
         self.store.update_task(task_id, status=status, result=result,
                                error=turn.error or None, finished_at=time.time())
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
@@ -394,10 +403,12 @@ class Office:
         ctx = AgentContext(self, role.id, None, "inbox")
         request = llm.RunRequest(
             agent_id=role.id,
-            system=config.fill(role.persona, self.principal()),
+            system=(config.fill(role.persona, self.principal())
+                    + notebook.lesson_block(self.store, role.id)),
             prompt=text,
             tools=tools.specs_for(role),
             native_tools=role.native_tools,
+            skills=role.skills,
             model=role.model_id,
             effort=role.effort,
             max_turns=role.max_turns,
@@ -429,8 +440,19 @@ class Office:
 
     def _record_usage(self, role, turn):
         self.store.add_usage_row(role.id, role.model_id, turn)
-        self.bus.publish("usage", agent_id=role.id, cost=turn.cost_usd,
-                         spend=self.store.spend())
+        # The topbar renders the rolling window and the day, so publish those.
+        # Publishing only the all-time figure left the display frozen at
+        # whatever it was when the page loaded.
+        now = time.time()
+        self.bus.publish(
+            "usage", agent_id=role.id, cost=turn.cost_usd,
+            tokens=(turn.input_tokens + turn.output_tokens
+                    + turn.cache_read + turn.cache_write),
+            spend={
+                "session": self.store.spend(now - config.SESSION_WINDOW_S),
+                "day": self.store.spend(now - 86400),
+                "total": self.store.spend(),
+            })
 
     def _budget_block(self):
         if self._paused_reason:

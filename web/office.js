@@ -176,7 +176,7 @@ async function loadState() {
       dir: 'up', state: 'idle', activity: 'desk',
       bubble: null, thought: '', tool: '', toolAt: -99,
       // Per-person offset so the room never blinks or breathes in unison.
-      phase: Math.random(), idleFor: 0
+      phase: Math.random(), idleFor: 0, prop: ''
     };
   }
   for (const a of state.agents) {
@@ -262,7 +262,11 @@ function handle(ev) {
     case 'approval.requested':
     case 'approval.decided': refreshApprovals(); pushFeed(ev); break;
     case 'usage':
-      if (p.spend) { S.spend.total = p.spend; renderSpend(); } break;
+      // The daemon sends every window the topbar might render. Writing only
+      // .total here is what left the counter frozen at page-load values.
+      if (p.spend) { Object.assign(S.spend, p.spend); renderSpend(); }
+      if (USAGE.open) loadUsage();
+      break;
     case 'user.message': pushFeed(ev); break;
     case 'office.budget':
       pushFeed({ ...ev, type: 'agent.error', payload: { text: p.reason } }); break;
@@ -275,7 +279,11 @@ function handle(ev) {
       const spot = BREAK_SPOTS[(Math.random() * BREAK_SPOTS.length) | 0];
       sp.activity = 'break';
       say(ev.agent_id, p.line);
-      sp.script = [{ type: 'goto', x: spot.x, y: spot.y }, { type: 'face', dir: 'down' }];
+      // The prop is picked up on arrival. Tying it to the activity meant a
+      // full mug materialised in someone's hand the instant they stood up.
+      sp.script = [{ type: 'goto', x: spot.x, y: spot.y },
+                   { type: 'face', dir: 'down' },
+                   { type: 'prop', prop: lookFor(ev.agent_id).vice }];
       pushFeed(ev); break;
     }
     case 'social.return':
@@ -334,6 +342,7 @@ function say(agentId, text) {
 }
 
 function sendHome(sp) {
+  sp.prop = '';                        // put the cup down before walking back
   sp.activity = 'desk';
   sp.script = [{ type: 'goto', x: sp.home.x, y: sp.home.y },
                { type: 'face', dir: 'up' }, { type: 'done' }];
@@ -405,6 +414,7 @@ function stepScript(sp) {
     if (step.type === 'say') { say(sp.id, step.text); sp.script.shift(); continue; }
     if (step.type === 'sayOther') { say(step.who, step.text); sp.script.shift(); continue; }
     if (step.type === 'wait') { sp.wait = step.s; sp.script.shift(); return; }
+    if (step.type === 'prop') { sp.prop = step.prop; sp.script.shift(); continue; }
     if (step.type === 'done') { sp.activity = 'desk'; sp.script.shift(); continue; }
     sp.script.shift();
   }
@@ -1000,16 +1010,24 @@ const HAIRS = ['#241a14', '#3d2a1c', '#5c3a20', '#8a5a2b', '#b98b45', '#dcc184',
 const STYLES = ['short', 'messy', 'ponytail', 'bun', 'long', 'curls', 'cap', 'bald'];
 const FACIAL = ['none', 'none', 'none', 'none', 'stubble', 'beard', 'moustache'];
 const ACCS = ['none', 'none', 'none', 'glasses', 'glasses', 'headphones', 'earrings'];
+// What someone does with a break, and what they do with their hands when
+// there is nothing to do. Neither costs a token: it is all client-side.
+const VICES = ['coffee', 'coffee', 'coffee', 'tea', 'smoke', 'snack', 'phone'];
+const HABITS = ['still', 'still', 'lean', 'tap', 'stretch', 'swivel'];
 
 const CAST = {
-  manager:    { skin: 2, hair: '#7d7a82', style: 'short',    facial: 'stubble', acc: 'none' },
-  sre:        { skin: 1, hair: '#3d2a1c', style: 'ponytail', facial: 'none',    acc: 'glasses' },
-  pipeline:   { skin: 3, hair: '#241a14', style: 'messy',    facial: 'none',    acc: 'headphones' },
-  comms:      { skin: 0, hair: '#8c3b2a', style: 'long',     facial: 'none',    acc: 'earrings' },
-  researcher: { skin: 4, hair: '#241a14', style: 'bun',      facial: 'none',    acc: 'glasses' },
-  scheduler:  { skin: 2, hair: '#5c3a20', style: 'cap',      facial: 'none',    acc: 'none' },
-  writer:     { skin: 1, hair: '#4a3122', style: 'curls',    facial: 'beard',   acc: 'none' },
-  analyst:    { skin: 5, hair: '#241a14', style: 'short',    facial: 'none',    acc: 'glasses' },
+  // Vices and habits are cast, not random: the manager who chain-smokes and
+  // the writer who never leaves his chair are characters, not noise.
+  manager:    { skin: 2, hair: '#7d7a82', style: 'short',    facial: 'stubble', acc: 'none',       vice: 'smoke',  habit: 'lean' },
+  sre:        { skin: 1, hair: '#3d2a1c', style: 'ponytail', facial: 'none',    acc: 'glasses',    vice: 'coffee', habit: 'tap' },
+  pipeline:   { skin: 3, hair: '#241a14', style: 'messy',    facial: 'none',    acc: 'headphones', vice: 'phone',  habit: 'swivel' },
+  comms:      { skin: 0, hair: '#8c3b2a', style: 'long',     facial: 'none',    acc: 'earrings',   vice: 'tea',    habit: 'still' },
+  researcher: { skin: 4, hair: '#241a14', style: 'bun',      facial: 'none',    acc: 'glasses',    vice: 'coffee', habit: 'stretch' },
+  scheduler:  { skin: 2, hair: '#5c3a20', style: 'cap',      facial: 'none',    acc: 'none',       vice: 'snack',  habit: 'swivel' },
+  writer:     { skin: 1, hair: '#4a3122', style: 'curls',    facial: 'beard',   acc: 'none',       vice: 'coffee', habit: 'lean' },
+  analyst:    { skin: 5, hair: '#241a14', style: 'short',    facial: 'none',    acc: 'glasses',    vice: 'tea',    habit: 'tap' },
+  hr:         { skin: 1, hair: '#b98b45', style: 'bun',      facial: 'none',    acc: 'none',       vice: 'tea',    habit: 'still' },
+  critic:     { skin: 3, hair: '#7d7a82', style: 'short',    facial: 'beard',   acc: 'glasses',    vice: 'smoke',  habit: 'lean' },
 };
 
 const _looks = {};
@@ -1032,6 +1050,8 @@ function lookFor(id) {
       style: pick(STYLES, 11),
       facial: pick(FACIAL, 17),
       acc: pick(ACCS, 21),
+      vice: pick(VICES, 5),
+      habit: pick(HABITS, 13),
     };
   }
   // Normalise before caching. A look is data that reaches shade(), and one
@@ -1044,6 +1064,8 @@ function lookFor(id) {
     style: STYLES.includes(look.style) ? look.style : 'short',
     facial: FACIAL.includes(look.facial) ? look.facial : 'none',
     acc: ACCS.includes(look.acc) ? look.acc : 'none',
+    vice: VICES.includes(look.vice) ? look.vice : 'coffee',
+    habit: HABITS.includes(look.habit) ? look.habit : 'still',
   };
   _looks[id] = { ...safe, skinHex: SKINS[safe.skin] };
   return _looks[id];
@@ -1079,6 +1101,10 @@ const OUTLINE = 'rgba(20,16,26,.90)';
 
 /* Person: 22 wide, 52 tall, feet at (0,0) of the given point. At this density
  * a face gets a brow, a nose and a mouth that can actually change shape. */
+const typingNow = (sp) =>
+  seated(sp) && sp.activity === 'desk'
+  && (sp.state === 'working' || sp.state === 'thinking');
+
 function paintPerson(r, sp) {
   const cx = Math.round(sp.x * T + T / 2);
   const cy = Math.round(sp.y * T + T - 4);
@@ -1111,13 +1137,29 @@ function paintPerson(r, sp) {
   const clothDark = shade(cloth, -44);
   const clothBounce = shade(cloth, -26);
 
-  const y0 = cy + (sitting ? 6 : 0) + bob + (sitting ? breath : 0);
-  const P = (dx, dy, w, h, c) => px(cx + dx, y0 + dy, w, h, c);
+  // An idle habit: something to do with the body when there is no work. Slow
+  // and small on purpose - a floor of people fidgeting in sync reads as a
+  // glitch rather than as character.
+  let lean = 0, sway = 0;
+  if (sitting && !typingNow(sp) && sp.idleFor > 3) {
+    const beat = V.t * 0.5 + sp.phase * 7;
+    if (look.habit === 'lean') lean = Math.sin(beat) > 0.75 ? 2 : 0;
+    else if (look.habit === 'tap') lean = 0;
+    else if (look.habit === 'stretch') lean = Math.sin(beat * 0.6) > 0.93 ? -3 : 0;
+    else if (look.habit === 'swivel') sway = Math.round(Math.sin(beat * 0.8) * 1.6);
+  }
 
-  /* ---- cast shadow: an ellipse, not a slab ---- */
-  P(-12, -3, 24, 5, 'rgba(16,12,24,.20)');
-  P(-14, -2, 28, 3, 'rgba(16,12,24,.16)');
-  P(-9, -4, 18, 2, 'rgba(16,12,24,.13)');
+  const y0 = cy + (sitting ? 6 : 0) + bob + (sitting ? breath : 0) + lean;
+  const P = (dx, dy, w, h, c) => px(cx + dx + sway, y0 + dy, w, h, c);
+  // The contact shadow is cast on the floor, so it must not lean or swivel
+  // with the body - it stays put while the person moves over it.
+  const G = (dx, dy, w, h, c) => px(cx + dx, cy + dy, w, h, c);
+
+  /* ---- cast shadow: an ellipse, not a slab, and pinned to the floor ---- */
+  const gy = sitting ? 6 : 0;
+  G(-12, gy - 3, 24, 5, 'rgba(16,12,24,.20)');
+  G(-14, gy - 2, 28, 3, 'rgba(16,12,24,.16)');
+  G(-9, gy - 4, 18, 2, 'rgba(16,12,24,.13)');
 
   /* ---- legs / chair ---- */
   if (sitting) {
@@ -1180,7 +1222,7 @@ function paintPerson(r, sp) {
   }
 
   /* ---- arms ---- */
-  const typing = sitting && (sp.state === 'working' || sp.state === 'thinking');
+  const typing = typingNow(sp);        // one definition, shared with the habits
   const armY = typing ? -26 : -32;
   if (facing !== 'up') {
     P(-17, armY, 4, 13, shade(cloth, -6));               // left arm is lit
@@ -1197,9 +1239,11 @@ function paintPerson(r, sp) {
     P(9, -14 + (1 - t) * 2, 5, 4, skinDark);
     P(9, -14 + (1 - t) * 2, 5, 1, skinMid);
   } else {
+    const tap = (sitting && look.habit === 'tap' && sp.idleFor > 3
+                 && Math.floor(V.t * 5 + sp.phase * 3) % 2) ? -1 : 0;
     P(-16, armY + 13, 4, 4, skinMid);
     P(-16, armY + 13, 4, 1, skin);
-    P(12, armY + 13, 4, 4, skinDark);
+    P(12, armY + 13 + tap, 4, 4, skinDark);
   }
 
   /* ---- head ---- */
@@ -1231,10 +1275,16 @@ function paintPerson(r, sp) {
   P(-5, hy + 17, 11, 1, skinDark);
   P(-10, hy + 12, 3, 4, skinMid);                        // jaw turns away
 
-  P(-12, hy + 6, 2, 6, skin);                            // ears
-  P(10, hy + 6, 2, 6, skinMid);
-  P(-12, hy + 8, 2, 3, skinMid);
-  P(10, hy + 8, 2, 3, skinDark);
+  // Only the ear on the viewer's side of a turned head exists. Drawing both
+  // put a spare ear in the middle of the cheek whenever someone looked sideways.
+  if (facing !== 'left') {
+    P(-12, hy + 6, 2, 6, skin);
+    P(-12, hy + 8, 2, 3, skinMid);
+  }
+  if (facing !== 'right') {
+    P(10, hy + 6, 2, 6, skinMid);
+    P(10, hy + 8, 2, 3, skinDark);
+  }
 
   P(-4, hy + 18, 8, 5, skinMid);                         // neck
   P(-4, hy + 18, 8, 2, skinDark);                        // shadow the head casts
@@ -1248,17 +1298,40 @@ function paintPerson(r, sp) {
     paintHair(P, look, hy, facing);
   }
 
-  /* ---- props ---- */
-  if (sp.activity === 'break') {
+  /* ---- what they take their break with ---- */
+  if (sp.prop === 'coffee' || sp.prop === 'tea') {
+    const brew = sp.prop === 'tea' ? '#9c6b3a' : '#5f3d24';
     P(13, -30, 9, 10, '#efe9dd');                        // mug
     P(13, -30, 3, 10, '#ffffff');
     P(19, -30, 3, 10, '#cdc5b4');
     P(13, -30, 9, 1, '#ffffff');
     P(13, -21, 9, 1, '#b3aa98');
-    P(15, -28, 5, 2, '#6f4a2e');
+    P(15, -28, 5, 2, brew);
     P(22, -27, 2, 5, '#d8d2c4');                         // handle
     const st = Math.floor(V.t * 1.8) % 3;                // steam
     P(16, -34 - st, 2, 3, `rgba(255,255,255,${0.30 - st * 0.08})`);
+  } else if (sp.prop === 'smoke') {
+    P(13, -31, 7, 2, '#efe9dd');                         // cigarette
+    P(19, -31, 2, 2, '#e0663c');                         // the lit end
+    P(19, -31, 2, 1, '#f0a05c');
+    // Smoke drifts up and sideways rather than rising in a column.
+    const t = V.t * 1.1 + sp.phase * 4;
+    for (let i = 0; i < 4; i++) {
+      const rise = ((t + i * 0.55) % 2.2);
+      const a = 0.26 * (1 - rise / 2.2);
+      if (a <= 0.01) continue;
+      P(20 + Math.round(Math.sin(rise * 2.6 + i) * 2),
+        -33 - Math.round(rise * 7), 2, 2, `rgba(226,222,214,${a.toFixed(3)})`);
+    }
+  } else if (sp.prop === 'snack') {
+    P(13, -29, 8, 7, '#c8863f');                         // pastry
+    P(13, -29, 8, 2, '#dda058');
+    P(15, -27, 4, 2, '#8a5527');
+    P(12, -22, 10, 2, '#e8e2d4');                        // napkin
+  } else if (sp.prop === 'phone') {
+    P(14, -31, 6, 10, '#26252f');
+    P(15, -30, 4, 8, '#5f88c4');
+    P(15, -30, 4, 2, Math.floor(V.t * 2) % 2 ? '#7aa6e0' : '#5f88c4');
   }
   if (look.acc === 'headphones' && facing !== 'up') {
     P(-15, hy + 4, 5, 11, '#252331');                    // cups
@@ -1397,24 +1470,38 @@ function paintFace(P, look, expr, sp, hy, skin, dark, facing) {
   const mouth = shade(skin, -62);        // warm, not near-black
 
   if (profile) {
-    // Three-quarter profile: one eye, a nose that breaks the silhouette,
-    // and a shorter mouth pushed toward the front of the face.
-    const ex = flip > 0 ? 2 : -6;
-    const nx = flip > 0 ? 9 : -12;
-    P(nx, noseY - 3, 3, 4, skin);                        // nose bridge
-    P(nx, noseY + 1, 3, 2, dark);
+    // A turned head is not the front view with one eye deleted. The whole face
+    // shifts toward the direction of travel, the far cheek becomes jaw, and
+    // the nose is a small step in the silhouette rather than a spur.
+    const F = flip;                                      // +1 right, -1 left
+    const edge = F > 0 ? 10 : -12;                       // front of the face
+    const back = F > 0 ? -10 : 8;                        // back of the skull
+
+    P(back, hy + 2, 2, 14, dark);                        // back of head recedes
+    P(F > 0 ? 7 : -9, hy + 3, 2, 12, shade(skin, -8));   // cheek plane
+
+    // Nose: two pixels of step, with the nostril shadow under it.
+    P(edge, noseY - 2, 2, 3, skin);
+    P(edge, noseY + 1, 2, 1, dark);
+    P(F > 0 ? 9 : -10, noseY - 3, 1, 5, shade(skin, 14));
+    // Brow ridge and chin are what actually read as a profile.
+    P(F > 0 ? 8 : -10, browY, 3, 2, shade(skin, 12));
+    P(F > 0 ? 6 : -9, hy + 16, 4, 2, dark);              // chin
+
+    const ex = F > 0 ? 3 : -7;                           // eye, pushed forward
     if (blinking || expr === 'happy' || expr === 'pleased') {
       P(ex, eyeY + 1, 4, 1, INK);
     } else {
-      // Same dark eye as the front view, shifted a pixel toward the nose.
-      P(ex, eyeY + (expr === 'think' ? -1 : 0), 4, 3, INK);
-      P(ex + (flip > 0 ? 3 : 0), eyeY + (expr === 'think' ? -1 : 0), 1, 1,
-        'rgba(255,255,255,.55)');
+      const dy = expr === 'think' ? -1 : 0;
+      P(ex, eyeY + dy, 4, 3, INK);
+      P(ex + (F > 0 ? 3 : 0), eyeY + dy, 1, 1, 'rgba(255,255,255,.55)');
     }
-    if (expr === 'focus' || expr === 'stern' || expr === 'cross')
-      P(ex, browY + 1, 4, 2, brow);
-    else P(ex, browY, 4, 2, brow);
-    P(flip > 0 ? 2 : -5, mouthY, 4, 1, mouth);
+    const bx = F > 0 ? 2 : -7;
+    P(bx, browY + (expr === 'focus' || expr === 'stern' || expr === 'cross' ? 2 : 1),
+      5, 1, brow);
+
+    // Mouth sits between the nose and the chin, not on the centre line.
+    P(F > 0 ? 4 : -7, mouthY, 3, 1, mouth);
     paintFacial(P, look, hy, skin);
     return;
   }
@@ -1755,22 +1842,24 @@ function mark(x, y, glyph, color) {
 }
 
 function speech(x, y, text, color) {
-  ctx.font = '12.5px system-ui';
-  const lines = wrap(text, 190, 4);
-  const lh = 16;
-  const w = Math.max(34, ...lines.map(l => ctx.measureText(l).width)) + 18;
-  const h = lines.length * lh + 12;
+  // Kept small on purpose: a bubble competes with the floor for space, and at
+  // 12.5px with generous padding two people talking hid a third of the room.
+  ctx.font = '11px system-ui';
+  const lines = wrap(text, 168, 4);
+  const lh = 13;
+  const w = Math.max(28, ...lines.map(l => ctx.measureText(l).width)) + 12;
+  const h = lines.length * lh + 8;
   const bx = Math.round(x - w / 2), by = Math.round(y - h);
 
   ctx.fillStyle = 'rgba(16,15,22,.94)';
   ctx.fillRect(bx, by, w, h);
   ctx.fillStyle = color;
   ctx.fillRect(bx, by, w, 2);
-  ctx.fillRect(Math.round(x) - 4, by + h, 8, 5);
+  ctx.fillRect(Math.round(x) - 3, by + h, 6, 4);
 
   ctx.fillStyle = '#ece3d6';
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  lines.forEach((l, i) => ctx.fillText(l, x, by + 6 + i * lh));
+  lines.forEach((l, i) => ctx.fillText(l, x, by + 4 + i * lh));
 }
 
 function wrap(text, maxW, maxLines) {
@@ -1903,6 +1992,12 @@ function wireUI() {
     if (e.target === $('modal')) $('modal').classList.add('hidden');
   });
   $('msgTo').onchange = updateComposerHint;
+  $('budgetStat').onclick = openUsage;
+  $('usageRefresh').onclick = loadUsage;
+  $('usageClose').onclick = closeUsage;
+  $('usageModal').addEventListener('click', (e) => {
+    if (e.target === $('usageModal')) closeUsage();
+  });
   $('filesBtn').onclick = openFiles;
   $('filesRefresh').onclick = loadFiles;
   $('filesClose').onclick = () => $('filesModal').classList.add('hidden');
@@ -2015,24 +2110,221 @@ async function decide(id, approved, response) {
 
 /* -------------------------------------------------------------- panels -- */
 
+function niceTokens(n) {
+  n = n || 0;
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + 'k';
+  return (n / 1000000).toFixed(2) + 'M';
+}
+
 function renderSpend() {
-  const day = (S.spend.day || {}).usd ?? 0;
-  const cap = S.spend.daily_budget || 0;
-  $('spend').textContent = cap ? `$${day.toFixed(3)} / $${cap.toFixed(2)}`
-                               : `$${day.toFixed(3)} · no cap`;
+  const session = S.spend.session || {};
+  const day = S.spend.day || {};
+  const tokens = session.tokens ?? 0;
+  const usd = session.usd ?? 0;
+  const hours = Math.round((S.spend.session_window_seconds || 18000) / 3600);
+  const tokenCap = S.spend.token_budget || 0;
+  const dayCap = S.spend.daily_budget || 0;
+
+  $('spendTokens').textContent = niceTokens(tokens) + ' tok';
+  $('spend').textContent = usd ? `$${usd.toFixed(3)}` : '$0.000';
+
   const fill = $('meterFill');
   const meter = fill && fill.parentElement;
   if (!fill) return;
-  // With no cap there is nothing to fill against; hide the bar rather than
-  // showing an empty one that implies plenty of room left.
+
+  // A meter needs a denominator. There is no way to read the plan's real
+  // limit, so the bar only appears against a ceiling you set yourself.
+  const [used, cap] = tokenCap ? [tokens, tokenCap] : [day.usd ?? 0, dayCap];
   if (meter) meter.classList.toggle('hidden', !cap);
-  if (!cap) return;
-  const pct = Math.min(100, day / cap * 100);
-  fill.style.width = pct.toFixed(1) + '%';
-  fill.className = pct > 92 ? 'over' : pct > 70 ? 'near' : '';
+  if (cap) {
+    const pct = Math.min(100, used / cap * 100);
+    fill.style.width = pct.toFixed(1) + '%';
+    fill.className = pct > 92 ? 'over' : pct > 70 ? 'near' : '';
+  }
+
+  const capLine = tokenCap
+    ? `\n${niceTokens(tokens)} of ${niceTokens(tokenCap)} tokens (OFFICE_SESSION_TOKEN_BUDGET).`
+    : dayCap ? `\n$${(day.usd ?? 0).toFixed(3)} of $${dayCap.toFixed(2)} today; the office pauses at the cap.`
+    : '\nNo ceiling set. OFFICE_SESSION_TOKEN_BUDGET adds one.';
   $('budgetStat').title =
-    `$${day.toFixed(3)} of $${cap.toFixed(2)} in the last 24h. `
-    + `The office pauses at the cap.`;
+    `Last ${hours}h: ${tokens.toLocaleString()} tokens, $${usd.toFixed(4)}.`
+    + `\nToday: ${(day.tokens ?? 0).toLocaleString()} tokens, $${(day.usd ?? 0).toFixed(4)}.`
+    + capLine + '\nClick for the per-employee breakdown.';
+}
+
+/* ----------------------------------------------------------------- usage -- */
+
+const USAGE = { open: false, window: 'session', data: null };
+
+const WINDOW_LABELS = [
+  ['session', 'Last 5h'], ['day', 'Today'], ['week', '7 days'], ['all', 'All time'],
+];
+
+async function openUsage() {
+  USAGE.open = true;
+  $('usageModal').classList.remove('hidden');
+  await loadUsage();
+}
+
+function closeUsage() {
+  USAGE.open = false;
+  $('usageModal').classList.add('hidden');
+}
+
+async function loadUsage() {
+  try {
+    USAGE.data = await (await fetch('/api/usage?window=' + USAGE.window)).json();
+  } catch {
+    $('usageBody').innerHTML = '<p class="muted">could not read usage</p>';
+    return;
+  }
+  renderUsage();
+}
+
+function renderUsage() {
+  const d = USAGE.data;
+  if (!d) return;
+
+  const tabs = $('usageWindows');
+  tabs.innerHTML = '';
+  for (const [id, label] of WINDOW_LABELS) {
+    const hours = Math.round((d.session_window_seconds || 18000) / 3600);
+    const b = el('button', 'uTab' + (id === USAGE.window ? ' on' : ''),
+                 id === 'session' ? `Last ${hours}h` : label);
+    b.onclick = () => { USAGE.window = id; loadUsage(); };
+    tabs.appendChild(b);
+  }
+
+  const body = $('usageBody');
+  body.innerHTML = '';
+  const t = d.totals || {};
+
+  if (!t.turns) {
+    body.innerHTML = '<p class="muted">Nothing recorded in this window yet.</p>';
+    return;
+  }
+
+  /* ---- headline numbers ---- */
+  const cards = el('div', 'uCards');
+  const card = (label, value, sub) => {
+    const c = el('div', 'uCard');
+    c.appendChild(el('div', 'uCardLabel', label));
+    c.appendChild(el('div', 'uCardValue', value));
+    if (sub) c.appendChild(el('div', 'uCardSub', sub));
+    return c;
+  };
+  const reads = d.cost_split.find(k => k.kind === 'cache_read') || { share: 0 };
+  cards.append(
+    card('Tokens', niceTokens(t.tokens), t.tokens.toLocaleString() + ' exactly'),
+    card('Cost', '$' + (t.cost || 0).toFixed(4),
+         d.token_budget ? '' : 'notional on a subscription'),
+    card('Turns', String(t.turns), 'model calls'),
+    card('Cache saving', niceTokens(t.cache_read),
+         `read back at a tenth of input price — ${reads.share}% of spend`),
+  );
+  body.appendChild(cards);
+
+  /* ---- where the money went, which is not where the tokens went ----
+   * Token volume and cost point in opposite directions: cache reads are
+   * usually the biggest column of tokens and the smallest column of spend.
+   * Showing volume alone made the cheapest thing look like the problem. */
+  body.appendChild(el('h3', 'uHead', 'Where the cost went'));
+  const KIND = {
+    output: ['Output', 'the most expensive token there is'],
+    cache_write: ['Cache written', 'first sight of a prompt, at 1.25x input'],
+    cache_read: ['Cache read', 'a tenth of input price — this is the saving'],
+    input: ['Fresh input', 'uncached prompt'],
+  };
+  const split = el('div', 'uSplit');
+  for (const k of d.cost_split) {
+    if (!k.tokens) continue;
+    const [label, note] = KIND[k.kind] || [k.kind, ''];
+    const row = el('div', 'uSplitRow' + (k.kind === 'cache_read' ? ' good' : ''));
+    row.innerHTML =
+      `<div class="uSplitHead"><span class="uWho">${label}</span>`
+      + `<span class="uTok">${niceTokens(k.tokens)} tok</span>`
+      + `<span class="uCost">$${k.cost.toFixed(5)}</span>`
+      + `<span class="uShare">${k.share}%</span></div>`
+      + `<div class="uBar"><i style="width:${k.share}%"></i></div>`
+      + `<div class="uBreak">${note}</div>`;
+    split.appendChild(row);
+  }
+  body.appendChild(split);
+  body.appendChild(el('p', 'muted uNote',
+    'Bars are share of cost, not share of tokens. Cache reads are cheap on '
+    + 'purpose: without them that prompt would be billed as fresh input at ten '
+    + 'times the rate. A large cache-read number is the caching working.'));
+
+  /* ---- per employee: the answer to "who is spending this" ---- */
+  body.appendChild(el('h3', 'uHead', 'By employee'));
+  const max = Math.max(...d.by_agent.map(a => a.tokens), 1);
+  const list = el('div', 'uRows');
+  for (const a of d.by_agent) {
+    const row = el('div', 'uRow');
+    const head = el('div', 'uRowHead');
+    head.innerHTML =
+      `<span class="uWho" style="color:${a.color}">${a.emoji} ${escapeHtml(a.name)}</span>`
+      + (a.departed ? '<span class="uGone">left</span>' : '')
+      + `<span class="uTok">${niceTokens(a.tokens)}</span>`
+      + `<span class="uCost">$${(a.cost || 0).toFixed(4)}</span>`;
+    row.appendChild(head);
+
+    const bar = el('div', 'uBar');
+    const fill = el('i');
+    fill.style.width = (a.tokens / max * 100).toFixed(1) + '%';
+    fill.style.background = a.color;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+
+    row.appendChild(el('div', 'uBreak',
+      `${a.turns} turn${a.turns === 1 ? '' : 's'}`
+      + (a.tasks ? ` over ${a.tasks} task${a.tasks === 1 ? '' : 's'}` : '')
+      + ` · $${a.cost_per_turn.toFixed(4)}/turn`
+      + (a.model_id ? ` · ${a.model_id}` : '')
+      + ` · in ${niceTokens(a.input)} · out ${niceTokens(a.output)}`
+      + ` · cache r/w ${niceTokens(a.cache_read)}/${niceTokens(a.cache_write)}`));
+
+    // Only shown when this person's own numbers justify it.
+    for (const tip of (a.advice || [])) {
+      const t = el('div', 'uTip', tip);
+      row.appendChild(t);
+    }
+    list.appendChild(row);
+  }
+  body.appendChild(list);
+
+  /* ---- per model ---- */
+  body.appendChild(el('h3', 'uHead', 'By model'));
+  const models = el('div', 'uRows');
+  for (const m of d.by_model) {
+    const row = el('div', 'uRow uRowTight');
+    row.innerHTML =
+      `<div class="uRowHead"><span class="uWho">${escapeHtml(m.model)}</span>`
+      + `<span class="uTok">${niceTokens(m.tokens)}</span>`
+      + `<span class="uCost">$${(m.cost || 0).toFixed(4)}</span></div>`
+      + `<div class="uBreak">${m.turns} turn${m.turns === 1 ? '' : 's'}</div>`;
+    models.appendChild(row);
+  }
+  body.appendChild(models);
+
+  /* ---- the raw turns, newest first ---- */
+  body.appendChild(el('h3', 'uHead', 'Recent turns'));
+  const recent = el('div', 'uTurns');
+  const byId = S.byId;
+  for (const r of d.recent) {
+    const who = byId[r.agent_id] || { emoji: '👤', name: r.agent_id, color: '' };
+    const line = el('div', 'uTurn');
+    line.innerHTML =
+      `<span class="when">${ago(r.ts)}</span>`
+      + `<span class="uWho" style="color:${who.color}">${who.emoji} ${escapeHtml(who.name)}</span>`
+      + `<span class="uModel">${escapeHtml(r.model)}</span>`
+      + `<span class="uTok">${niceTokens((r.input_tokens || 0) + (r.output_tokens || 0)
+           + (r.cache_read || 0) + (r.cache_write || 0))}</span>`
+      + `<span class="uCost">$${(r.cost_usd || 0).toFixed(4)}</span>`;
+    recent.appendChild(line);
+  }
+  body.appendChild(recent);
 }
 
 function tickClock() {
@@ -2414,6 +2706,63 @@ function select(options, value, labeller) {
   return node;
 }
 
+/** Skills are a long list from several sources, so this one filters. */
+function skillPicker(chosen) {
+  const all = STAFF.catalogue.skills || [];
+  const picked = new Set(chosen || []);
+  const box = el('div', 'skPick');
+
+  const search = el('input', 'skSearch');
+  search.placeholder = `Filter ${all.length} skills…`;
+  const list = el('div', 'skList');
+
+  const draw = () => {
+    const q = search.value.trim().toLowerCase();
+    list.innerHTML = '';
+    // Anything granted stays visible even when filtered out, so a skill can
+    // always be un-ticked without first guessing the search term back.
+    const rows = all.filter(sk =>
+      picked.has(sk.id) || !q
+      || sk.id.toLowerCase().includes(q)
+      || (sk.description || '').toLowerCase().includes(q));
+    if (!rows.length) { list.appendChild(el('div', 'sHint', 'no match')); return; }
+    for (const sk of rows.slice(0, 60)) {
+      const row = el('label', 'skRow' + (picked.has(sk.id) ? ' on' : ''));
+      const cb = el('input');
+      cb.type = 'checkbox'; cb.checked = picked.has(sk.id);
+      cb.onchange = () => {
+        cb.checked ? picked.add(sk.id) : picked.delete(sk.id);
+        draw();
+      };
+      const meta = el('div', 'skMeta');
+      meta.appendChild(el('div', 'skName', sk.id));
+      if (sk.description) meta.appendChild(el('div', 'skDesc', sk.description));
+      row.append(cb, meta);
+      list.appendChild(row);
+    }
+  };
+  search.oninput = draw;
+
+  // A plugin's declared name does not always match its directory, so the
+  // derived id can be wrong. Typing the exact name has to stay possible.
+  const manual = el('div', 'skManual');
+  const free = el('input', 'skSearch');
+  free.placeholder = 'or type an exact name, e.g. vercel:nextjs';
+  const add = el('button', 'ghost', 'Add');
+  add.onclick = (e) => {
+    e.preventDefault();
+    const v = free.value.trim();
+    if (v) { picked.add(v); free.value = ''; draw(); }
+  };
+  free.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); add.click(); } };
+  manual.append(free, add);
+
+  box.append(search, list, manual);
+  box._chosen = picked;
+  draw();
+  return box;
+}
+
 function checkboxes(names, chosen, help) {
   const box = el('div', 'sChecks');
   const picked = new Set(chosen || []);
@@ -2464,8 +2813,12 @@ function summaryCard(person) {
   tags.appendChild(el('span', 'sTag', `effort ${person.effort}`));
   tags.appendChild(el('span', 'sTag', `${person.max_turns} turns`));
   const skills = [...person.office_tools, ...person.native_tools];
+  const agentSkills = person.skills || [];
   tags.appendChild(el('span', 'sTag sTagSkills',
-    skills.length ? `${skills.length} skills` : 'no skills'));
+    skills.length ? `${skills.length} tools` : 'no tools'));
+  if (agentSkills.length)
+    tags.appendChild(el('span', 'sTag sTagAgentSkills',
+      `${agentSkills.length} skill${agentSkills.length === 1 ? '' : 's'}`));
 
   const actions = el('div', 'sActions');
   const edit = el('button', 'ghost', 'Edit');
@@ -2485,6 +2838,12 @@ function summaryCard(person) {
   head.append(who, tags, actions);
   card.appendChild(head);
   card.appendChild(el('div', 'sSkills', skills.join(' · ') || '—'));
+  if (agentSkills.length) {
+    const row = el('div', 'sAgentSkills');
+    row.appendChild(el('span', 'sAgentSkillsLabel', 'skills'));
+    for (const sk of agentSkills) row.appendChild(el('span', 'skChip', sk));
+    card.appendChild(row);
+  }
   return card;
 }
 
@@ -2503,6 +2862,7 @@ function editorCard(person) {
   const officeTools = checkboxes(
     STAFF.catalogue.office_tools, person.office_tools, STAFF.help);
   const nativeTools = checkboxes(STAFF.catalogue.native_tools, person.native_tools);
+  const skillBox = skillPicker(person.skills);
   const persona = el('textarea');
   persona.value = person.persona;
   persona.rows = 10;
@@ -2517,6 +2877,9 @@ function editorCard(person) {
     field('Office tools', officeTools, 'Hover a name for what it does.'),
     field('Claude Code tools', nativeTools,
           'Bash, Write and Edit are gated by the approval queue.'),
+    field('Skills', skillBox,
+          'Agent Skills, granted per employee. Each one enabled adds its '
+          + 'description to every request this person runs, so grant few.'),
     field('Persona', persona, 'This is the entire system prompt for this employee.'),
   );
 
@@ -2529,6 +2892,7 @@ function editorCard(person) {
       model: model.value, effort: effort.value, max_turns: turns.value,
       office_tools: chosenFrom(officeTools),
       native_tools: chosenFrom(nativeTools),
+      skills: [...skillBox._chosen],
       persona: persona.value,
     });
     if (ok) { STAFF.editing = null; renderStaff(); }
@@ -2568,6 +2932,7 @@ function renderHire() {
   const officeTools = checkboxes(STAFF.catalogue.office_tools,
                                  ['note', 'ask_human', 'finish'], STAFF.help);
   const nativeTools = checkboxes(STAFF.catalogue.native_tools, []);
+  const skillBox = skillPicker([]);
   const persona = el('textarea');
   persona.rows = 10;
   persona.placeholder =
@@ -2585,6 +2950,8 @@ function renderHire() {
     field('Max turns', turns),
     field('Office tools', officeTools),
     field('Claude Code tools', nativeTools),
+    field('Skills', skillBox, 'Optional. Each one adds its description to '
+          + 'every request this person runs.'),
     field('Persona', persona, 'At least 20 characters. This is their whole brief.'),
   );
 
@@ -2596,6 +2963,7 @@ function renderHire() {
       model: model.value, effort: effort.value, max_turns: turns.value,
       office_tools: chosenFrom(officeTools),
       native_tools: chosenFrom(nativeTools),
+      skills: [...skillBox._chosen],
       persona: persona.value,
     });
     if (ok) { STAFF.editing = null; renderStaff(); }

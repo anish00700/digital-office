@@ -13,10 +13,11 @@
   <div class="brand"><span class="logo">🏢</span> Digital Office</div>
   <div class="stat" id="conn"><span class="dot"></span><span id="connText">connecting</span></div>
   <div class="stat" title="Time the daemon has been running">⏱ <span id="uptime">–</span></div>
-  <div class="stat budget" id="budgetStat" title="Spend in the last 24h against your daily cap">
-    💸 <span id="spend">–</span>
+  <button class="stat budget" id="budgetStat" title="Token usage — click for the breakdown">
+    🪙 <span id="spendTokens">–</span>
+    <span class="spendCost" id="spend">–</span>
     <span class="meter"><i id="meterFill"></i></span>
-  </div>
+  </button>
   <div class="stat" id="backendStat" title="Active LLM backend">⚙ <span id="backend">–</span></div>
   <div class="spacer"></div>
   <button id="filesBtn" class="pill" title="Files your staff have written">📁 Files</button>
@@ -86,6 +87,24 @@
     <div class="setupActions">
       <button id="setupGo" class="btn-ok">Open the office</button>
     </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="usageModal">
+  <div class="sheet wide">
+    <div class="sheetHead">
+      <h2>Token usage</h2>
+      <div class="sheetTools">
+        <button id="usageRefresh" class="ghost">Refresh</button>
+        <button id="usageClose" class="ghost">Close</button>
+      </div>
+    </div>
+    <div class="uWindows" id="usageWindows"></div>
+    <div id="usageBody"></div>
+    <p class="muted uFoot">This is what <b>this office</b> has spent, measured from
+      its own records. It is not your Claude account's usage — a plan's real
+      remaining limit is not something the SDK exposes, so nothing here can
+      tell you how close you are to it.</p>
   </div>
 </div>
 

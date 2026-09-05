@@ -16,7 +16,7 @@ import re
 import threading
 import time
 
-from . import config
+from . import config, skills as skills_mod
 
 # The live set. None until load() runs, so anything that reads the roster
 # before the daemon has a store (config.validate, --help) sees the seed.
@@ -78,6 +78,7 @@ def catalogue():
     return {
         "office_tools": sorted(tools.tool_names()),
         "native_tools": list(config.NATIVE_TOOL_CHOICES),
+        "skills": skills_mod.discover(),
         "models": list(config.MODEL_CHOICES),
         "efforts": list(config.EFFORT_CHOICES),
         "free_desks": free_desks(),
@@ -97,6 +98,7 @@ def as_dict(role, full=False):
             "persona": role.persona,
             "office_tools": list(role.office_tools),
             "native_tools": list(role.native_tools),
+            "skills": list(role.skills),
             "model": role.model,
             "model_id": role.model_id,
             "effort": role.effort,
@@ -118,6 +120,7 @@ def _to_row(role, active=1, hired_at=None):
         "persona": role.persona,
         "office_tools": json.dumps(list(role.office_tools)),
         "native_tools": json.dumps(list(role.native_tools)),
+        "skills": json.dumps(list(role.skills)),
         "model": role.model, "effort": role.effort,
         "max_turns": int(role.max_turns), "reports_to": role.reports_to,
         "active": active, "hired_at": hired_at if hired_at is not None else time.time(),
@@ -137,6 +140,7 @@ def _from_row(row):
         persona=row["persona"],
         office_tools=_tuple(row["office_tools"]),
         native_tools=_tuple(row["native_tools"]),
+        skills=_tuple(row.get("skills") if hasattr(row, "get") else row["skills"]),
         model=row["model"] or "", effort=row["effort"] or "low",
         max_turns=int(row["max_turns"] or 8),
         reports_to=row["reports_to"] or "",
@@ -319,6 +323,7 @@ def import_office(store, doc):
                 "persona": entry.get("persona"),
                 "office_tools": entry.get("office_tools", []),
                 "native_tools": entry.get("native_tools", []),
+                "skills": entry.get("skills", []),
                 "model": entry.get("model", ""),
                 "effort": entry.get("effort", "low"),
                 "max_turns": entry.get("max_turns", 8),
@@ -419,6 +424,12 @@ def _validate_common(fields, *, existing_id=None):
         out["native_tools"] = _clean_tools(
             fields["native_tools"], set(config.NATIVE_TOOL_CHOICES), "native tool")
 
+    if "skills" in fields:
+        try:
+            out["skills"] = skills_mod.clean(fields["skills"])
+        except ValueError as exc:
+            raise RosterError(str(exc)) from None
+
     if "model" in fields:
         model = str(fields["model"] or "").strip()
         if model not in config.MODEL_CHOICES:
@@ -498,6 +509,7 @@ def hire(store, fields):
                 "office_tools": fields.get("office_tools",
                                            ["note", "ask_human", "finish"]),
                 "native_tools": fields.get("native_tools", []),
+                "skills": fields.get("skills", []),
                 "model": fields.get("model", ""),
                 "effort": fields.get("effort", "low"),
                 "max_turns": fields.get("max_turns", 8),
@@ -547,7 +559,7 @@ def update(store, agent_id, fields):
 
         editable = {k: v for k, v in fields.items() if k in (
             "name", "title", "emoji", "color", "persona", "office_tools",
-            "native_tools", "model", "effort", "max_turns", "desk")}
+            "native_tools", "skills", "model", "effort", "max_turns", "desk")}
         if not editable:
             raise RosterError("nothing to change")
 

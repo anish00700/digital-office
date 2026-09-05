@@ -114,6 +114,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body, "application/json", {
                 "Content-Disposition": f'attachment; filename="office-{stamp}.json"',
             })
+        if route == "/api/usage":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            return self._json(self._usage(qs.get("window", ["session"])[0]))
         if route == "/api/files":
             return self._json({"files": self._workspace_listing()})
         if route.startswith("/api/file/"):
@@ -211,7 +214,10 @@ class Handler(BaseHTTPRequestHandler):
             "spend": {
                 "total": store.spend(),
                 "day": store.spend_since(time.time() - 86400),
+                "session": store.spend_since(time.time() - config.SESSION_WINDOW_S),
                 "daily_budget": config.DAILY_BUDGET_USD,
+                "token_budget": config.SESSION_TOKEN_BUDGET,
+                "session_window_seconds": config.SESSION_WINDOW_S,
             },
             "backend": self.office.backend.name,
             "auth": self.office.backend.describe_auth(),
@@ -256,6 +262,126 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"id: {event['seq']}\ndata: {payload}\n\n".encode("utf-8"))
         self.wfile.flush()
 
+    # -- usage ----------------------------------------------------------
+    WINDOWS = {
+        "session": None,          # resolved from config at call time
+        "day": 86400,
+        "week": 7 * 86400,
+        "all": None,
+    }
+
+    @staticmethod
+    def _cost_split(rows):
+        """Where the money actually went, by token kind.
+
+        The SDK reports one total and no breakdown, so this apportions it using
+        list prices. Worth doing because volume and cost point in opposite
+        directions here: cache reads are usually the largest column of tokens
+        and the smallest column of spend, and a panel that only counts tokens
+        makes the cheapest thing in the office look like the problem.
+        """
+        kinds = {k: {"tokens": 0, "cost": 0.0}
+                 for k in ("input", "output", "cache_read", "cache_write")}
+        for r in rows:
+            pin, pout = config.PRICING.get(r["model"], (2.0, 10.0))
+            rates = {
+                "input": pin,
+                "output": pout,
+                "cache_read": pin * config.CACHE_READ_DISCOUNT,
+                "cache_write": pin * config.CACHE_WRITE_MULTIPLIER,
+            }
+            for kind, col in (("input", "input_tokens"), ("output", "output_tokens"),
+                              ("cache_read", "cache_read"), ("cache_write", "cache_write")):
+                n = r[col] or 0
+                kinds[kind]["tokens"] += n
+                kinds[kind]["cost"] += n * rates[kind] / 1_000_000
+        total = sum(k["cost"] for k in kinds.values()) or 1.0
+        out = []
+        for name, v in kinds.items():
+            out.append({"kind": name, "tokens": v["tokens"],
+                        "cost": round(v["cost"], 6),
+                        "share": round(v["cost"] / total * 100, 1)})
+        out.sort(key=lambda k: k["cost"], reverse=True)
+        return out
+
+    @staticmethod
+    def _advice(agent, role):
+        """Concrete, evidence-backed suggestions. Only fires on the levers that
+        actually move cost, and only when this employee's own numbers justify
+        it - generic advice about being efficient helps nobody."""
+        tips = []
+        turns = agent["turns"] or 1
+        out_per_turn = agent["output"] / turns
+        write_per_turn = agent["cache_write"] / turns
+
+        if role and role.model_id == "opus" and out_per_turn < 700:
+            tips.append(f"On opus but averaging {out_per_turn:.0f} output tokens a "
+                        f"turn. Opus output is 2.5x sonnet; sonnet would likely do.")
+        if out_per_turn > 1200:
+            tips.append(f"Averaging {out_per_turn:.0f} output tokens a turn, and "
+                        f"output is the most expensive token there is. Ask for a "
+                        f"length limit in the persona.")
+        if role and write_per_turn > 3000:
+            tips.append(f"{write_per_turn:.0f} tokens of cache written per turn - "
+                        f"that is the persona plus tool definitions being re-cached. "
+                        f"A shorter persona or fewer tools shrinks it.")
+        if role and role.max_turns > 10 and turns >= 2:
+            tips.append(f"max_turns is {role.max_turns}. Every extra round trip "
+                        f"re-reads the whole prompt; lower it if the work does not "
+                        f"need the headroom.")
+        if role and len(role.office_tools) + len(role.native_tools) > 9:
+            tips.append(f"Holding {len(role.office_tools) + len(role.native_tools)} "
+                        f"tools. Every definition is re-sent and re-cached on every "
+                        f"request, whether or not it gets used.")
+        return tips
+
+    def _usage(self, window):
+        store = self.office.store
+        now = time.time()
+        span = config.SESSION_WINDOW_S if window == "session" \
+            else self.WINDOWS.get(window, 86400)
+        since = 0.0 if window == "all" or span is None and window == "all" \
+            else (now - (span or config.SESSION_WINDOW_S))
+        if window == "all":
+            since = 0.0
+
+        by_id = {r.id: r for r in config.ROSTER}
+        rows = store.usage_recent(since, limit=5000)
+        done = store.tasks_done_by(since)
+        agents = []
+        for row in store.usage_by_agent(since):
+            role = by_id.get(row["agent_id"])
+            turns = row["turns"] or 1
+            mine = [r for r in rows if r["agent_id"] == row["agent_id"]]
+            agents.append({
+                **row,
+                "name": role.name if role else row["agent_id"],
+                "emoji": role.emoji if role else "👤",
+                "color": role.color if role else "#8a8580",
+                "departed": role is None,
+                "model_id": role.model_id if role else "",
+                "max_turns": role.max_turns if role else 0,
+                "tool_count": (len(role.office_tools) + len(role.native_tools)) if role else 0,
+                "cost_per_turn": round((row["cost"] or 0) / turns, 6),
+                "tasks": done.get(row["agent_id"], 0),
+                "cost_split": self._cost_split(mine),
+                "advice": self._advice(row, role),
+            })
+        return {
+            "window": window,
+            "since": since,
+            "now": now,
+            "window_seconds": 0 if window == "all" else (now - since),
+            "first_turn": store.usage_first_ts(since),
+            "totals": store.usage_totals(since),
+            "cost_split": self._cost_split(rows),
+            "by_agent": agents,
+            "by_model": store.usage_by_model(since),
+            "recent": store.usage_recent(since, limit=40),
+            "token_budget": config.SESSION_TOKEN_BUDGET,
+            "session_window_seconds": config.SESSION_WINDOW_S,
+        }
+
     # -- workspace ------------------------------------------------------
     # Anything an agent writes lands in the workspace. Without a way to see and
     # pull those files out, work an agent finished is work you cannot collect.
@@ -265,11 +391,16 @@ class Handler(BaseHTTPRequestHandler):
             return []
         out = []
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.name.startswith("."):
+            if not path.is_file():
                 continue
             try:
                 rel = path.relative_to(root)
             except ValueError:
+                continue
+            # Every component, not just the filename. Checking only the name
+            # listed - and served - the contents of dot-directories, so a
+            # .env or a .secrets/ dropped in the workspace was downloadable.
+            if any(part.startswith(".") for part in rel.parts):
                 continue
             stat = path.stat()
             out.append({
@@ -289,8 +420,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, "not found", "text/plain")
         target = (root / relative).resolve()
         try:
-            target.relative_to(root)
+            rel = target.relative_to(root)
         except ValueError:
+            return self._send(403, "forbidden", "text/plain")
+        if any(part.startswith(".") for part in rel.parts):
             return self._send(403, "forbidden", "text/plain")
         if target.is_symlink() or not target.is_file():
             return self._send(404, "not found", "text/plain")
@@ -320,9 +453,26 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), ctype, {"Cache-Control": "no-cache"})
 
 
+class _Server(ThreadingHTTPServer):
+    """A browser closing an SSE stream is normal, not an error.
+
+    The default handler dumps a full traceback for every dropped connection,
+    so a page reload writes a stack trace and a dozen of them bury whatever
+    actually went wrong.
+    """
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            log.debug("client %s went away: %s", client_address[0], exc)
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(office):
     Handler.office = office
-    httpd = ThreadingHTTPServer((config.HOST, config.PORT), Handler)
+    httpd = _Server((config.HOST, config.PORT), Handler)
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
     thread.start()

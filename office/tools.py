@@ -196,6 +196,46 @@ async def _recall(args, ctx):
 
 
 # ---------------------------------------------------------------------------
+# Shared context and self-improvement
+# ---------------------------------------------------------------------------
+
+async def _read_context(args, ctx):
+    from . import notebook
+    text = notebook.read_context()
+    if not text.strip():
+        return "the shared context file is empty"
+    return text[:notebook.MAX_CONTEXT_CHARS]
+
+
+async def _write_context(args, ctx):
+    """Rewrites the standing-context prose. The activity log the office keeps
+    below it is preserved - an agent must not be able to erase the record."""
+    from . import notebook
+    body = (args.get("text") or "").strip()
+    if len(body) < 20:
+        return "give the whole standing-context section, not a fragment"
+    current = notebook.read_context()
+    _, mark, tail = current.partition(notebook._LOG_MARK)
+    keep = (notebook._LOG_MARK + tail) if mark else ""
+    notebook.write_context(f"# Office context\n\n{body}\n\n{keep}")
+    ctx.emit("say", text="Updated the office context.")
+    return "written"
+
+
+async def _learn(args, ctx):
+    """One durable note, for this employee only."""
+    text = (args.get("lesson") or "").strip()
+    if not text:
+        return "nothing to record"
+    ok = ctx.store.add_lesson(ctx.agent_id, text)
+    if not ok:
+        return "not recorded - too short, or you already know that"
+    kept = len(ctx.store.lessons(ctx.agent_id))
+    return (f"recorded. You now carry {kept} note(s); the oldest drops off "
+            f"past {ctx.store.LESSON_LIMIT}, so keep them worth the space.")
+
+
+# ---------------------------------------------------------------------------
 # People Ops
 # ---------------------------------------------------------------------------
 
@@ -322,6 +362,17 @@ _SPECS = {
     "recall": ToolSpec(
         "recall", "Read a stored fact. Empty key lists all keys.",
         {"key": str}, _recall),
+    "read_context": ToolSpec(
+        "read_context", "Read the office's shared context file: standing notes "
+                        "and recent activity.", {}, _read_context),
+    "write_context": ToolSpec(
+        "write_context", "Replace the standing-context prose in the shared file. "
+                         "The activity log is preserved.",
+        {"text": str}, _write_context, read_only=False),
+    "learn": ToolSpec(
+        "learn", "Record one short, reusable lesson for yourself. Carried into "
+                 "every later task you run.",
+        {"lesson": str}, _learn, read_only=False),
     "list_skills": ToolSpec(
         "list_skills", "Every tool, model and effort level an employee can be "
                        "given, and how many desks are free.",

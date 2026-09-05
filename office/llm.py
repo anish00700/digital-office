@@ -49,6 +49,7 @@ class RunRequest:
     prompt: str
     tools: list = field(default_factory=list)      # list[ToolSpec]
     native_tools: tuple = ()
+    skills: tuple = ()
     model: str = ""
     effort: str = "low"
     max_turns: int = 8
@@ -154,7 +155,16 @@ class AgentSDKBackend:
             system_prompt=req.system,
             # BUDGET: [] means do not read ~/.claude or ./.claude. Keeps
             # CLAUDE.md and user settings out of the context window entirely.
-            setting_sources=[],
+            #
+            # Skills need their source directories, and the SDK widens this
+            # itself when `skills` is set - so leave it alone rather than
+            # guessing at a wider set than it would have chosen. The cost of
+            # that widening is real and worth knowing: an employee holding a
+            # skill also picks up ~/.claude/settings.json, and an `allow` rule
+            # there (e.g. Bash) would auto-approve calls before this office's
+            # approval gate is ever consulted. Grant skills accordingly.
+            **({} if req.skills else {"setting_sources": []}),
+            skills=list(req.skills) if req.skills else None,
             tools=list(req.native_tools) or [],
             allowed_tools=allowed,
             mcp_servers={"office": server} if server else {},

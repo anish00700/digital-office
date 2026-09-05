@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS roster (
     persona TEXT NOT NULL,
     office_tools TEXT NOT NULL DEFAULT '[]',
     native_tools TEXT NOT NULL DEFAULT '[]',
+    skills TEXT NOT NULL DEFAULT '[]',
     model TEXT NOT NULL DEFAULT '',
     effort TEXT NOT NULL DEFAULT 'low',
     max_turns INTEGER NOT NULL DEFAULT 8,
@@ -104,6 +105,14 @@ CREATE TABLE IF NOT EXISTS roster (
     active INTEGER NOT NULL DEFAULT 1,
     hired_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_lessons_agent ON lessons(agent_id, ts);
 CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -135,7 +144,16 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self.db.executescript(SCHEMA)
+            self._migrate()
             self.db.commit()
+
+    def _migrate(self):
+        """CREATE TABLE IF NOT EXISTS never adds a column to a table that
+        already exists, so anything added after the first release needs this."""
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(roster)")}
+        if "skills" not in have:
+            self.db.execute(
+                "ALTER TABLE roster ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'")
 
     def _run(self, sql, args=(), *, fetch=None):
         with self._lock:
@@ -149,6 +167,39 @@ class Store:
                 out = cur.lastrowid
             self.db.commit()
             return out
+
+    # -- lessons -----------------------------------------------------------
+    # What an employee has worked out about this office that is worth carrying
+    # into the next task. Deliberately few and short: they are prepended to the
+    # system prompt, so they are re-sent (and re-cached) on every request that
+    # employee runs. A long notebook is a permanent tax, not an improvement.
+    LESSON_LIMIT = 6
+    LESSON_CHARS = 240
+
+    def add_lesson(self, agent_id, text):
+        text = " ".join(str(text or "").split())[:self.LESSON_CHARS]
+        if len(text) < 12:
+            return False
+        existing = [r["text"].lower() for r in self.lessons(agent_id)]
+        if text.lower() in existing:
+            return False
+        self._run("INSERT INTO lessons (ts, agent_id, text) VALUES (?,?,?)",
+                  (time.time(), agent_id, text))
+        # Keep only the newest few; the oldest fall off rather than accumulate.
+        self._run(
+            "DELETE FROM lessons WHERE agent_id=? AND id NOT IN"
+            " (SELECT id FROM lessons WHERE agent_id=? ORDER BY ts DESC LIMIT ?)",
+            (agent_id, agent_id, self.LESSON_LIMIT))
+        return True
+
+    def lessons(self, agent_id):
+        return self._run(
+            "SELECT id, ts, text FROM lessons WHERE agent_id=? ORDER BY ts",
+            (agent_id,), fetch="all") or []
+
+    def forget_lesson(self, agent_id, lesson_id):
+        self._run("DELETE FROM lessons WHERE agent_id=? AND id=?",
+                  (agent_id, lesson_id))
 
     # -- settings ----------------------------------------------------------
     # Office-level configuration the owner sets once, in the GUI, and which
@@ -178,8 +229,8 @@ class Store:
     def write_role(self, row):
         """Insert or replace one roster row. `row` is a plain dict of columns."""
         cols = ("id", "name", "title", "emoji", "color", "desk_x", "desk_y",
-                "persona", "office_tools", "native_tools", "model", "effort",
-                "max_turns", "reports_to", "active", "hired_at")
+                "persona", "office_tools", "native_tools", "skills", "model",
+                "effort", "max_turns", "reports_to", "active", "hired_at")
         self._run(
             f"INSERT OR REPLACE INTO roster ({','.join(cols)})"
             f" VALUES ({','.join('?' * len(cols))})",
@@ -405,3 +456,69 @@ class Store:
 
     def spend_since(self, since):
         return self.spend(since)
+
+    # -- usage breakdown ---------------------------------------------------
+    # The single spend number tells you the office cost something; it never
+    # tells you who spent it. These group the same rows by the two axes that
+    # answer that: which employee, and which model.
+    _USAGE_COLS = (
+        "COUNT(*) turns,"
+        " COALESCE(SUM(input_tokens),0) input,"
+        " COALESCE(SUM(output_tokens),0) output,"
+        " COALESCE(SUM(cache_read),0) cache_read,"
+        " COALESCE(SUM(cache_write),0) cache_write,"
+        " COALESCE(SUM(input_tokens+output_tokens+cache_read+cache_write),0) tokens,"
+        " COALESCE(SUM(cost_usd),0) cost"
+    )
+
+    @staticmethod
+    def _round_usage(row):
+        row = dict(row or {})
+        row["cost"] = round(row.get("cost") or 0.0, 6)
+        return row
+
+    def usage_totals(self, since=0.0):
+        return self._round_usage(self._run(
+            f"SELECT {self._USAGE_COLS} FROM usage WHERE ts >= ?",
+            (since,), fetch="one",
+        ))
+
+    def usage_by_agent(self, since=0.0):
+        rows = self._run(
+            f"SELECT agent_id, {self._USAGE_COLS} FROM usage WHERE ts >= ?"
+            " GROUP BY agent_id ORDER BY tokens DESC",
+            (since,), fetch="all",
+        ) or []
+        return [self._round_usage(r) for r in rows]
+
+    def usage_by_model(self, since=0.0):
+        rows = self._run(
+            f"SELECT model, {self._USAGE_COLS} FROM usage WHERE ts >= ?"
+            " GROUP BY model ORDER BY tokens DESC",
+            (since,), fetch="all",
+        ) or []
+        return [self._round_usage(r) for r in rows]
+
+    def usage_recent(self, since=0.0, limit=40):
+        return self._run(
+            "SELECT ts, agent_id, model, input_tokens, output_tokens,"
+            " cache_read, cache_write, cost_usd FROM usage"
+            " WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            (since, limit), fetch="all",
+        ) or []
+
+    def tasks_done_by(self, since=0.0):
+        """Finished tasks per assignee, so usage can be read per unit of work
+        rather than per model call."""
+        rows = self._run(
+            "SELECT assignee, COUNT(*) n FROM tasks"
+            " WHERE status='done' AND COALESCE(finished_at, created_at) >= ?"
+            " GROUP BY assignee", (since,), fetch="all") or []
+        return {r["assignee"]: r["n"] for r in rows}
+
+    def usage_first_ts(self, since=0.0):
+        """When the earliest turn in this window happened - what a rolling
+        window is actually measuring from."""
+        row = self._run("SELECT MIN(ts) t FROM usage WHERE ts >= ?",
+                        (since,), fetch="one") or {}
+        return row.get("t")

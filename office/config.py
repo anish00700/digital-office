@@ -50,6 +50,15 @@ BACKEND = os.environ.get("OFFICE_BACKEND", "agentsdk").strip().lower()
 DAILY_BUDGET_USD = float(os.environ.get("OFFICE_DAILY_BUDGET_USD", "2.00"))
 # Hard ceiling for a single task, enforced by the SDK itself.
 TASK_BUDGET_USD = float(os.environ.get("OFFICE_TASK_BUDGET_USD", "0.15"))
+# Optional soft ceiling on tokens in the rolling session window, purely for
+# the meter in the GUI. There is no way to read your plan's real limit - the
+# SDK does not expose account rate-limit state - so this is your own number,
+# and it warns rather than stopping anything. 0 = no meter.
+SESSION_TOKEN_BUDGET = int(os.environ.get("OFFICE_SESSION_TOKEN_BUDGET", "0"))
+# The window the GUI calls "session". Claude subscription limits roll every
+# five hours, so that is the default worth watching.
+SESSION_WINDOW_S = int(os.environ.get("OFFICE_SESSION_WINDOW", str(5 * 3600)))
+
 # How long a worker waits on a human before giving up and reporting back.
 APPROVAL_TIMEOUT_S = int(os.environ.get("OFFICE_APPROVAL_TIMEOUT", "900"))
 # Tool results are the biggest silent token sink in an agent loop. Truncate.
@@ -123,6 +132,7 @@ class Role:
     persona: str
     office_tools: tuple = ()   # our in-process MCP tools
     native_tools: tuple = ()   # Claude Code built-ins this role may use
+    skills: tuple = ()         # Agent Skills, by name or plugin:name
     model: str = ""
     effort: str = "low"        # BUDGET: low = fewer, more consolidated calls
     max_turns: int = 8         # BUDGET: hard cap on tool round trips
@@ -135,7 +145,7 @@ class Role:
 
 # Every worker gets these. Kept deliberately short: each tool definition is
 # re-sent on every request, so the tool surface is a recurring token cost.
-_WORKER_TOOLS = ("note", "ask_human", "finish")
+_WORKER_TOOLS = ("note", "ask_human", "finish", "read_context", "learn")
 
 _ROLE_LIST = (
     Role(
@@ -149,7 +159,12 @@ _ROLE_LIST = (
         max_turns=14,
         reports_to="",
         office_tools=("list_staff", "assign", "wait", "task_status",
-                      "message_user", "remember", "recall"),
+                      "message_user", "remember", "recall",
+                      "read_context", "write_context", "learn"),
+        # Miles keeps the office's written memory: the shared context file and,
+        # at the end of a session, the handoff. The skill supplies the format.
+        native_tools=("Read", "Write"),
+        skills=("session-handoff:session-handoff",),
         persona="""You are Miles, Chief of Staff of a digital office that works for {principal}.
 
 Your job is to DELEGATE, not to do the work. When a request arrives:
@@ -161,6 +176,8 @@ Your job is to DELEGATE, not to do the work. When a request arrives:
 
 Match the deliverable to someone who can actually produce it. list_staff tells you what each person can do, not just what they know: if the answer needs to be a saved file, assign it to somebody who saves files, or you will get the document back as chat text with nowhere to put it. Say in the brief where the file should go and what it should be called.
 5. Report with message_user: what was done, what it found, what needs a decision. Lead with the answer.
+
+You keep the office's written memory. `CLAUDE.md` in the workspace is what everyone here can read: read_context before assuming you have no history, and write_context when something becomes standing context rather than a one-off - conventions, decisions, who is good at what, what the principal keeps asking for. The activity log underneath it writes itself; leave it alone. When your principal says the session is over, write SESSION_HANDOFF.md with the session-handoff skill, overwriting whatever was there.
 
 Hard rules:
 - Never invent a fact no specialist reported. Unverified means unverified, and you say so.
