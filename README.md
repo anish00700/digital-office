@@ -1,7 +1,8 @@
 # Digital Office
 
-A staff of Claude agents that work for you: a chief of staff who delegates, seven
-specialists who do the work, and a browser window showing the floor.
+A staff of Claude agents that work for you: a chief of staff who delegates, eight
+specialists who do the work — one of whom hires the rest — and a browser window
+showing the floor.
 
 The office is a **daemon**. The GUI is a viewer that attaches to it over HTTP and
 an event stream. Close the tab, close your laptop, log out — the agents keep
@@ -14,7 +15,7 @@ working, and the floor replays exactly as it stands when you open it again.
         SSE events │                   │ REST
 ┌──────────────────┴───────────────────▼────────────────┐
 │  daemon (long-running)                                │
-│    Miles the manager ──assign──▶ 7 specialist workers │
+│    Miles the manager ──assign──▶ 8 specialist workers │
 │    approval gate ──▶ you        SQLite = all state    │
 └───────────────────────────────────────────────────────┘
 ```
@@ -31,17 +32,147 @@ working, and the floor replays exactly as it stands when you open it again.
 | 🗓️ | **Cal** | Scheduling | calendar.md, reminders, planning a realistic week |
 | ✍️ | **Quill** | Writing | emails, docs, postmortems — finished prose, not outlines |
 | 📊 | **Vera** | Analysis | runs Python, shows the arithmetic |
+| ⚖️ | **Sol** | Red Team | attacks a finding before reality does |
+| 🪪 | **Wren** | People Ops | designs and hires new staff. Runs on Opus |
 
-Edit `ROSTER` in `office/config.py` to change personas, models, desks, or to hire
-someone new. A new `Role` entry is hired on the next restart, desk and all.
+### Hiring by describing the job
+
+Wren is People Ops. Pick her in the composer's **To** box and describe the work
+you want done, and she designs the employee for it: persona, model, effort, turn
+cap and the smallest tool surface that can do the job. She checks the existing
+staff first and will tell you to use Ada rather than hire a second Ada.
+
+The hire itself stops for you. Wren's proposal arrives as an approval card with
+the full persona and a blunt warning if she is asking for `Bash`, `Write` or
+`Edit` — an agent that creates agents is exactly the thing that should need a
+human to say yes. Declining is an answer; she will ask what you would change.
+
+She runs on **Opus** by default, because designing an employee is the one job
+here whose cost is paid again on every task that employee ever runs.
+
+The **To** box also works for everyone else: leave it on Miles to have work
+delegated, or send a job straight to a specialist when you already know who you
+want and would rather not pay for Miles to read it first.
+
+### First run: pick who works here
+
+The first time you open the GUI it asks two things — who the office works for,
+and which staff to start with:
+
+| Pack | Who you get |
+|---|---|
+| **Empty office** | Miles and Wren only. Describe the work and Wren designs the staff. |
+| **Infrastructure team** | SRE, CI/CD, comms, research, scheduling, writing, analysis. |
+| **Solo studio** | Inbox, calendar, drafts and numbers, without the infra roles. |
+| **Research desk** | Researcher, red team, analyst, writer, scheduling. |
+
+None of it is permanent: every pack is just a starting roster you can fire,
+rewrite and add to. Miles and Wren are in all of them, because one delegates
+and the other hires — that is the machinery, not the subject matter.
+
+To skip the screen on a provisioned or headless install, name the pack in the
+environment and it seeds on first boot:
+
+```bash
+OFFICE_PACK=research
+OFFICE_PRINCIPAL="a machine learning researcher at a small lab"
+```
+
+Desks are assigned from the floor plan at seed time rather than hardcoded per
+role, so any combination of staff seats itself without collisions.
+
+### Saving and moving an office
+
+An office is a file: everyone who works there — personas, tools, models, effort,
+turn caps — plus who the office works for.
+
+```bash
+./officectl export my-devops     # -> ~/.digital-office/offices/my-devops.json
+./officectl import my-devops
+./officectl offices              # what you can import
+```
+
+**Your offices are stored outside the project**, under `~/.digital-office`
+(override with `OFFICE_HOME`). They survive a `git pull`, a re-clone, or
+deleting the checkout entirely. The `offices/` directory *inside* the repo is
+shipped templates — product content, not your data — and both resolve by bare
+name, so `./officectl import devops` restores the original infrastructure team.
+
+Export and import both work whether or not the daemon is running: a stopped
+office is the one you most want to be able to back up. The Staff panel has the
+same two buttons.
+
+Import replaces the roster: anyone not in the file is let go (soft delete —
+their history stays). Every field is validated the same way a hand edit is, so
+a file cannot grant a tool that does not exist or a colour the renderer cannot
+draw, and a rejected file changes nothing.
+
+This is a config file, not a backup — it carries no tasks, transcripts, usage
+or memory. For a true backup, copy the database: `cp data/office.db somewhere`.
+
+### Whose office is it
+
+Personas never name a profession. They write `{principal}`, and it is filled in
+per office from `OFFICE_PRINCIPAL`:
+
+```bash
+OFFICE_PRINCIPAL="a solo product designer running a small studio"
+```
+
+Substitution happens per request, so changing it lands on the next task without
+reseeding anything. Wren is told to write `{principal}` too, so the staff she
+designs stay portable rather than being pinned to one job.
+
+`OFFICE_PRINCIPAL` seeds this on first run; after that the value you set in
+the setup screen is the truth, and `POST /api/principal` changes it.
+
+### Editing the staff by hand
+
+Hit **Staff** in the top bar to hire someone, let someone go, or change what an
+existing employee is: their model, effort, turn cap, tools and persona. Changes
+land on that employee's next task — nobody is interrupted mid-job — and they
+persist in SQLite, so the roster survives a restart the way tasks do.
+
+Upgrading one person for one hard job is the intended use: put Ada on `opus` at
+`high` effort while you debug something nasty, then drop her back to the default
+when you're done. `model` left empty means `OFFICE_MODEL_SMART` (`sonnet`).
+
+```
+POST /api/roster/hire     {name, title, emoji, persona, model, effort,
+                           max_turns, office_tools[], native_tools[]}
+POST /api/roster/update   {id, ...any of the above}
+POST /api/roster/fire     {id}
+GET  /api/roster          roster + the catalogue of tools, models and free desks
+```
+
+New hires are seated automatically in the next free desk from `DESK_SLOTS` in
+`office/config.py` — the floor plan has a fixed number of desks, so the office
+fills up. Firing is a soft delete: their tasks, transcript and usage history
+stay readable and the desk frees up. Miles cannot be fired.
+
+`ROSTER` in `office/config.py` is now `DEFAULT_ROSTER`: the seed written to the
+database on first boot. After that the database is the truth, so editing the
+Python file will not change an office that has already run.
 
 ## Quick start
 
 ```bash
-./officectl setup     # venv + dependencies (needs Python 3.10+)
+./officectl setup     # venv + dependencies + a .env to fill in
 ./officectl start     # background daemon
 open http://127.0.0.1:8765
 ```
+
+`setup` writes a `.env` in the project root from `deploy/office.env.example`.
+Every `officectl` command reads it, so credentials and settings survive a new
+terminal instead of living in whichever shell happened to launch the daemon.
+Anything already exported wins, so one-off overrides still work:
+
+```bash
+OFFICE_BACKEND=mock ./officectl run
+```
+
+The file is parsed, not sourced — a config file should not be able to run
+commands — so it takes plain `KEY=value` lines with optional quotes.
 
 Try it for free first — no credentials, no spend, the floor fully animated:
 
