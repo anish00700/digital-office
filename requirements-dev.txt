@@ -1,0 +1,9 @@
+# Test dependencies. Not needed to run the office.
+#
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/python -m pytest tests/ -q --asyncio-mode=auto
+#
+# asyncio-mode=auto matters: several tests are `async def`, and without it
+# pytest skips them with a warning rather than failing.
+pytest>=8.0
+pytest-asyncio>=0.24

@@ -13,11 +13,19 @@ os.environ.setdefault("OFFICE_BACKEND", "mock")
 # A fresh office seeds only Miles and Wren; the domain staff are a first-run
 # choice. Name the pack so these tests get the team they delegate to.
 os.environ.setdefault("OFFICE_PACK", "devops")
+# The mock backend fails 18% of tasks on purpose, which made the delegation
+# test fail roughly one run in five. It went unnoticed because the recorded
+# failures were never asserted on.
+os.environ.setdefault("OFFICE_MOCK_FAILURE_RATE", "0")
 _TMP = tempfile.mkdtemp(prefix="office-test-")
 os.environ["OFFICE_DATA_DIR"] = os.path.join(_TMP, "data")
 os.environ["OFFICE_WORKSPACE"] = os.path.join(_TMP, "workspace")
 
 from office import config  # noqa: E402
+
+# Same reason: the env var above is only read at config import time, and
+# another test module may have imported it first. Pin the resolved value.
+config.DEFAULT_PACK = "devops"
 from office.office import AgentContext, Office  # noqa: E402
 from office.tools import _is_auto_allowed_shell, _within_workspace  # noqa: E402
 
@@ -27,6 +35,23 @@ failures = []
 def check(label, got, want):
     if got != want:
         failures.append(f"{label}: got {got!r}, want {want!r}")
+
+
+try:                                             # pytest is optional here:
+    import pytest                                # this file also runs as
+except ImportError:                              # `python -m tests.test_safety`
+    pytest = None
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _fail_on_recorded_checks():
+        """check() records into a module-level list and nothing asserted on it,
+        so under pytest every single check was a no-op - the suite reported
+        success with a deliberately broken shell allowlist. This makes the
+        recorded failures actually fail the test they came from."""
+        failures.clear()
+        yield
+        assert not failures, "\n" + "\n".join(failures)
 
 
 def test_shell_allowlist():
