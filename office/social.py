@@ -110,6 +110,8 @@ class SocialLife:
     # -- called by the orchestrator ------------------------------------
     def note_status(self, agent_id, status):
         """Track how long someone has been doing nothing."""
+        if agent_id != config.MANAGER_ID and agent_id not in config.STAFF_IDS:
+            return                      # fired mid-task; their worker is winding down
         if status == "idle":
             self.idle_since.setdefault(agent_id, time.time())
         else:
@@ -117,6 +119,13 @@ class SocialLife:
             if agent_id in self.on_break:
                 # Work arrived - break's over, back to your desk.
                 self._end_break(agent_id)
+
+    def forget(self, agent_id):
+        """Someone left. Drop their ambient state so they are not still on a
+        coffee break, or expected back from one, after the desk is empty."""
+        self.idle_since.pop(agent_id, None)
+        self.on_break.pop(agent_id, None)
+        self.in_office.discard(agent_id)
 
     def _end_break(self, agent_id):
         self.on_break.pop(agent_id, None)

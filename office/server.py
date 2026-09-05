@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import config
+from . import config, roster
 
 log = logging.getLogger("office.http")
 
@@ -102,6 +102,29 @@ class Handler(BaseHTTPRequestHandler):
             })
         if route == "/api/tasks":
             return self._json({"tasks": self.office.store.tasks()})
+        if route == "/api/setup":
+            return self._json({
+                "needed": roster.setup_needed(self.office.store),
+                "packs": roster.packs(),
+                "principal": self.office.principal(),
+            })
+        if route == "/api/export":
+            body = json.dumps(self.office.export_office(), indent=2, default=str)
+            stamp = time.strftime("%Y%m%d-%H%M")
+            return self._send(200, body, "application/json", {
+                "Content-Disposition": f'attachment; filename="office-{stamp}.json"',
+            })
+        if route == "/api/files":
+            return self._json({"files": self._workspace_listing()})
+        if route.startswith("/api/file/"):
+            return self._workspace_file(
+                urllib.parse.unquote(route[len("/api/file/"):]))
+        if route == "/api/roster":
+            return self._json({
+                "roster": [roster.as_dict(r, full=True) for r in config.ROSTER],
+                "catalogue": roster.catalogue(),
+                "tool_help": self.office.tool_help(),
+            })
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -114,7 +137,7 @@ class Handler(BaseHTTPRequestHandler):
             text = (body.get("text") or "").strip()
             if not text:
                 return self._json({"error": "empty"}, 400)
-            self.office.submit_user_message(text)
+            self.office.submit_user_message(text, body.get("to"))
             return self._json({"ok": True})
 
         if route == "/api/approval":
@@ -126,7 +149,53 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "unknown or already decided"}, 404)
             return self._json({"ok": True, "status": row["status"]})
 
+        if route == "/api/setup":
+            try:
+                self.office.install_pack((body.get("pack") or "").strip(),
+                                         body.get("principal") or "")
+            except roster.RosterError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json({"ok": True})
+
+        if route == "/api/principal":
+            text = (body.get("principal") or "").strip()
+            if not 3 <= len(text) <= 400:
+                return self._json({"error": "principal must be 3-400 characters"}, 400)
+            self.office.store.set_setting("principal", text)
+            return self._json({"ok": True, "principal": text})
+
+        if route == "/api/import":
+            try:
+                installed, retired = self.office.import_office(body)
+            except roster.RosterError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json({"ok": True, "installed": installed,
+                               "retired": retired})
+
+        if route.startswith("/api/roster/"):
+            return self._roster_write(route.rsplit("/", 1)[-1], body)
+
         return self._send(404, "not found", "text/plain")
+
+    def _roster_write(self, action, body):
+        """Hire, fire, or change one employee. RosterError carries a message
+        written for the person reading it, so it goes straight through."""
+        try:
+            if action == "hire":
+                role = self.office.hire_employee(body)
+            elif action == "fire":
+                role = self.office.fire_employee((body.get("id") or "").strip())
+            elif action == "update":
+                agent_id = (body.get("id") or "").strip()
+                fields = {k: v for k, v in body.items() if k != "id"}
+                role = self.office.update_employee(agent_id, fields)
+            else:
+                return self._send(404, "not found", "text/plain")
+        except roster.RosterError as exc:
+            return self._json({"error": str(exc)}, 400)
+        except KeyError:
+            return self._json({"error": "no such employee"}, 404)
+        return self._json({"ok": True, "employee": roster.as_dict(role, full=True)})
 
     do_HEAD = do_GET
 
@@ -134,12 +203,7 @@ class Handler(BaseHTTPRequestHandler):
     def _state(self):
         store = self.office.store
         return {
-            "roster": [
-                {"id": r.id, "name": r.name, "title": r.title, "emoji": r.emoji,
-                 "color": r.color, "desk": list(r.desk),
-                 "manager": r.id == config.MANAGER_ID}
-                for r in config.ROSTER
-            ],
+            "roster": [roster.as_dict(r, full=True) for r in config.ROSTER],
             "agents": store.agents(),
             "tasks": store.tasks(limit=60),
             "messages": store.messages(limit=60),
@@ -151,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
             },
             "backend": self.office.backend.name,
             "auth": self.office.backend.describe_auth(),
+            "setup_needed": roster.setup_needed(store),
+            "principal": self.office.principal(),
             "started_at": self.office.started_at,
             "now": time.time(),
             "seq": store.max_event_seq(),
@@ -189,6 +255,56 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.dumps(event, default=str)
         self.wfile.write(f"id: {event['seq']}\ndata: {payload}\n\n".encode("utf-8"))
         self.wfile.flush()
+
+    # -- workspace ------------------------------------------------------
+    # Anything an agent writes lands in the workspace. Without a way to see and
+    # pull those files out, work an agent finished is work you cannot collect.
+    def _workspace_listing(self):
+        root = config.WORKSPACE.resolve()
+        if not root.is_dir():
+            return []
+        out = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                continue
+            stat = path.stat()
+            out.append({
+                "path": str(rel),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": stat.st_mtime,
+            })
+        out.sort(key=lambda f: f["modified"], reverse=True)
+        return out[:400]
+
+    def _workspace_file(self, relative):
+        """Serve one workspace file. Resolved and re-checked against the root,
+        so `..` and absolute paths cannot climb out of it."""
+        root = config.WORKSPACE.resolve()
+        if not relative:
+            return self._send(404, "not found", "text/plain")
+        target = (root / relative).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return self._send(403, "forbidden", "text/plain")
+        if target.is_symlink() or not target.is_file():
+            return self._send(404, "not found", "text/plain")
+
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        inline = ctype.startswith("text/") or ctype in (
+            "application/json", "application/javascript")
+        if inline:
+            ctype += "; charset=utf-8"
+        disposition = "inline" if inline else "attachment"
+        return self._send(200, target.read_bytes(), ctype, {
+            "Content-Disposition": f'{disposition}; filename="{target.name}"',
+            "Cache-Control": "no-cache",
+        })
 
     def _file(self, relative):
         target = (config.WEB_DIR / relative).resolve()

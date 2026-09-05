@@ -13,11 +13,14 @@
   <div class="brand"><span class="logo">🏢</span> Digital Office</div>
   <div class="stat" id="conn"><span class="dot"></span><span id="connText">connecting</span></div>
   <div class="stat" title="Time the daemon has been running">⏱ <span id="uptime">–</span></div>
-  <div class="stat" title="Spend in the last 24h against your daily cap">
+  <div class="stat budget" id="budgetStat" title="Spend in the last 24h against your daily cap">
     💸 <span id="spend">–</span>
+    <span class="meter"><i id="meterFill"></i></span>
   </div>
   <div class="stat" id="backendStat" title="Active LLM backend">⚙ <span id="backend">–</span></div>
   <div class="spacer"></div>
+  <button id="filesBtn" class="pill" title="Files your staff have written">📁 Files</button>
+  <button id="staffBtn" class="pill" title="Hire, edit and let go of employees">👥 Staff</button>
   <button id="approvalsBtn" class="pill hidden">⚠ <span id="approvalsCount">0</span> waiting on you</button>
 </header>
 
@@ -31,6 +34,10 @@
   <section class="stage">
     <canvas id="floor"></canvas>
     <div class="composer">
+      <label class="toWrap" title="Who should get this">
+        <span class="toLabel">To</span>
+        <select id="msgTo"></select>
+      </label>
       <input id="msg" type="text" autocomplete="off" spellcheck="false"
              placeholder="Ask Miles for something — he'll delegate it…">
       <button id="send">Send</button>
@@ -54,6 +61,66 @@
       <button id="modalClose" class="ghost">Close</button>
     </div>
     <div id="approvals"></div>
+  </div>
+</div>
+
+<div class="modal setup hidden" id="setupModal">
+  <div class="sheet setupSheet">
+    <div class="setupHead">
+      <h1>Set up your office</h1>
+      <p class="muted">Pick who works here to begin with. None of it is
+        permanent — you can hire, fire and rewrite anyone afterwards, and Wren
+        in People Ops will design new staff whenever you describe a job.</p>
+    </div>
+
+    <label class="sField setupPrincipal">
+      <span class="sLabel">Who does this office work for?</span>
+      <textarea id="setupPrincipal" rows="2"></textarea>
+      <span class="sHint">Every employee is told this. Be specific — it is the
+        difference between generic help and someone who knows your work.</span>
+    </label>
+
+    <div class="packs" id="packs"></div>
+
+    <div id="setupErr" class="staffErr hidden"></div>
+    <div class="setupActions">
+      <button id="setupGo" class="btn-ok">Open the office</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="filesModal">
+  <div class="sheet">
+    <div class="sheetHead">
+      <h2>Workspace</h2>
+      <div class="sheetTools">
+        <button id="filesRefresh" class="ghost">Refresh</button>
+        <button id="filesClose" class="ghost">Close</button>
+      </div>
+    </div>
+    <p class="muted filesNote">Everything your staff write lands here. Click a
+      file to open it, or use Download to save it.</p>
+    <div id="filesList"></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="staffModal">
+  <div class="sheet wide">
+    <div class="sheetHead">
+      <h2>Staff</h2>
+      <div class="sheetTools">
+        <button id="staffExport" class="ghost" title="Save this office to a file">Export</button>
+        <button id="staffImport" class="ghost" title="Replace this office from a file">Import</button>
+        <input id="staffFile" type="file" accept="application/json,.json" hidden>
+        <button id="staffClose" class="ghost">Close</button>
+      </div>
+    </div>
+    <p class="muted staffNote">Changes land on each employee's next task — nobody
+      is interrupted mid-job. Desks come from the floor plan, so the office can
+      hold a fixed number of people.</p>
+    <div id="staffErr" class="staffErr hidden"></div>
+    <div id="staffList"></div>
+    <div id="staffHire"></div>
   </div>
 </div>
 

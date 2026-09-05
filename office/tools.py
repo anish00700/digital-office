@@ -107,12 +107,25 @@ async def _fetch_mail(args, ctx):
 # ---------------------------------------------------------------------------
 
 async def _list_staff(args, ctx):
+    """Titles alone are not enough to delegate well: a job whose deliverable is
+    a file has to go to somebody who can write one, and the title never says
+    who that is. Capabilities are listed so the choice is informed."""
     lines = []
     statuses = {a["id"]: a["status"] for a in ctx.store.agents()}
     for r in config.ROSTER:
         if r.id == config.MANAGER_ID:
             continue
-        lines.append(f"{r.id} ({r.title}) - {statuses.get(r.id, 'idle')}")
+        can = []
+        if "Write" in r.native_tools or "Edit" in r.native_tools:
+            can.append("saves files")
+        if "Bash" in r.native_tools:
+            can.append("runs commands")
+        if "WebSearch" in r.native_tools or "WebFetch" in r.native_tools:
+            can.append("searches the web")
+        if "Read" in r.native_tools or "Grep" in r.native_tools:
+            can.append("reads files")
+        lines.append(f"{r.id} ({r.title}) - {statuses.get(r.id, 'idle')}"
+                     + (f" - {', '.join(can)}" if can else " - answers in text only"))
     return "\n".join(lines)
 
 
@@ -124,7 +137,11 @@ async def _assign(args, ctx):
     brief = (args.get("brief") or "").strip()
     if not brief:
         return "brief is required - say what done looks like"
-    task_id = await ctx.office.assign(assignee, title, brief, created_by=ctx.agent_id)
+    try:
+        task_id = await ctx.office.assign(assignee, title, brief,
+                                          created_by=ctx.agent_id)
+    except KeyError:
+        return f"{assignee} no longer works here. Valid: {', '.join(config.STAFF_IDS)}"
     return f"assigned {task_id} to {assignee}"
 
 
@@ -179,6 +196,87 @@ async def _recall(args, ctx):
 
 
 # ---------------------------------------------------------------------------
+# People Ops
+# ---------------------------------------------------------------------------
+
+def _split(raw):
+    """Tool lists arrive as one comma- or space-separated string: the tool
+    schema is flat, and a string round-trips through every backend cleanly."""
+    if isinstance(raw, (list, tuple)):
+        return [str(v).strip() for v in raw if str(v).strip()]
+    return [t.strip() for t in str(raw or "").replace(",", " ").split() if t.strip()]
+
+
+async def _list_skills(args, ctx):
+    from . import roster as roster_mod
+    cat = roster_mod.catalogue()
+    helps = describe_tools()
+    lines = ["OFFICE TOOLS (grant by name):"]
+    for name in sorted(cat["office_tools"]):
+        lines.append(f"  {name} - {helps.get(name, '')}")
+    lines.append("")
+    lines.append("CLAUDE CODE TOOLS:")
+    lines.append("  Read, Grep, Glob, WebSearch, WebFetch - run immediately.")
+    lines.append("  Bash, Write, Edit - can change this machine; every use stops "
+                 "for human approval.")
+    lines.append("")
+    default = cat["default_model"]
+    lines.append("MODELS: " + ", ".join(m or f'"" (default, currently {default})'
+                                        for m in cat["models"]))
+    lines.append("EFFORT: " + ", ".join(cat["efforts"]))
+    lines.append(f"FREE DESKS: {len(cat['free_desks'])}")
+    return "\n".join(lines)
+
+
+async def _hire_employee(args, ctx):
+    """Design review happens in the model; the hire itself is a human decision.
+
+    A new employee can be granted Bash and Write, so an agent creating agents
+    is exactly the kind of thing that should stop and ask."""
+    from . import roster as roster_mod
+
+    fields = {
+        "name": (args.get("name") or "").strip(),
+        "title": (args.get("title") or "").strip(),
+        "emoji": (args.get("emoji") or "").strip(),
+        "persona": (args.get("persona") or "").strip(),
+        "model": (args.get("model") or "").strip(),
+        "effort": (args.get("effort") or "low").strip(),
+        "max_turns": args.get("max_turns") or 8,
+        "office_tools": _split(args.get("office_tools")) or ["note", "ask_human", "finish"],
+        "native_tools": _split(args.get("native_tools")),
+    }
+    if not fields["name"]:
+        return "name is required"
+    if len(fields["persona"]) < 20:
+        return ("persona is required, and it must be the whole system prompt for "
+                "this employee - not a description of one")
+
+    granted = fields["office_tools"] + fields["native_tools"]
+    risky = [t for t in fields["native_tools"] if t in ("Bash", "Write", "Edit")]
+    summary = (
+        f"{fields['emoji']} {fields['name']} - {fields['title'] or 'Staff'}\n"
+        f"model: {fields['model'] or 'default'}   effort: {fields['effort']}   "
+        f"max turns: {fields['max_turns']}\n"
+        f"tools: {', '.join(granted) or 'none'}\n"
+        + (f"CAN CHANGE THIS MACHINE: {', '.join(risky)}\n" if risky else "")
+        + f"\n{fields['persona']}"
+    )
+    ok = await ctx.request_approval("hire", summary, detail="Wren wants to hire")
+    if not ok:
+        return "your principal declined this hire. Ask what they would change."
+
+    try:
+        role = ctx.office.hire_employee(fields)
+    except roster_mod.RosterError as exc:
+        return f"could not hire: {exc}"
+    ctx.emit("say", text=f"Hired {role.name} as {role.title}.")
+    return (f"hired {role.id} ({role.name}, {role.title}) at desk "
+            f"{list(role.desk)} on {role.model_id}. They start on the next task "
+            f"assigned to them.")
+
+
+# ---------------------------------------------------------------------------
 
 _SPECS = {
     "note": ToolSpec(
@@ -224,11 +322,34 @@ _SPECS = {
     "recall": ToolSpec(
         "recall", "Read a stored fact. Empty key lists all keys.",
         {"key": str}, _recall),
+    "list_skills": ToolSpec(
+        "list_skills", "Every tool, model and effort level an employee can be "
+                       "given, and how many desks are free.",
+        {}, _list_skills),
+    "hire_employee": ToolSpec(
+        "hire_employee",
+        "Hire a new employee. persona is their entire system prompt. "
+        "office_tools/native_tools are space-separated names from list_skills. "
+        "Your principal approves the hire.",
+        {"name": str, "title": str, "emoji": str, "persona": str, "model": str,
+         "effort": str, "max_turns": int, "office_tools": str,
+         "native_tools": str},
+        _hire_employee, read_only=False),
 }
 
 
 def specs_for(role):
     return [_SPECS[n] for n in role.office_tools if n in _SPECS]
+
+
+def tool_names():
+    """Every office tool an employee can be given. Used to validate edits from
+    the staff panel and to populate its checkboxes."""
+    return set(_SPECS)
+
+
+def describe_tools():
+    return {name: spec.description for name, spec in _SPECS.items()}
 
 
 # ---------------------------------------------------------------------------

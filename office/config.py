@@ -55,6 +55,23 @@ APPROVAL_TIMEOUT_S = int(os.environ.get("OFFICE_APPROVAL_TIMEOUT", "900"))
 # Tool results are the biggest silent token sink in an agent loop. Truncate.
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("OFFICE_MAX_TOOL_RESULT", "4000"))
 
+# -- who this office works for ---------------------------------------------
+# Personas write {principal} rather than naming a profession, and it is
+# substituted at request time. An office that hardcodes its owner's job into
+# every system prompt can only ever belong to one person.
+PRINCIPAL = os.environ.get(
+    "OFFICE_PRINCIPAL",
+    "one person: your principal. Assume competence and skip basic explanation",
+).strip()
+
+
+def fill(text: str, principal: str = "") -> str:
+    """Resolve persona placeholders. Applied to seeded and hand-written
+    personas alike, so changing who the office works for takes effect on the
+    next task rather than needing the roster reseeded."""
+    return (text or "").replace("{principal}", principal or PRINCIPAL)
+
+
 # Model aliases, resolved by the backend. Aliases rather than pinned IDs so a
 # subscription plan can serve whatever tier it is entitled to.
 MODEL_SMART = os.environ.get("OFFICE_MODEL_SMART", "sonnet")
@@ -120,7 +137,7 @@ class Role:
 # re-sent on every request, so the tool surface is a recurring token cost.
 _WORKER_TOOLS = ("note", "ask_human", "finish")
 
-ROSTER = (
+_ROLE_LIST = (
     Role(
         id="manager",
         name="Miles",
@@ -133,7 +150,7 @@ ROSTER = (
         reports_to="",
         office_tools=("list_staff", "assign", "wait", "task_status",
                       "message_user", "remember", "recall"),
-        persona="""You are Miles, Chief of Staff of a digital office that works for one person: your principal, a DevOps engineer.
+        persona="""You are Miles, Chief of Staff of a digital office that works for {principal}.
 
 Your job is to DELEGATE, not to do the work. When a request arrives:
 
@@ -141,12 +158,14 @@ Your job is to DELEGATE, not to do the work. When a request arrives:
 2. Otherwise split it into the fewest independent tasks that cover it, and assign each to the right specialist. Prefer one task over three.
 3. Write briefs a stranger could execute: the goal, the constraints, what "done" looks like, and context the specialist cannot see. Never restate the request verbatim as a brief.
 4. wait on what you assigned. Read results critically. Reassign only if a result is actually wrong, not merely terse.
+
+Match the deliverable to someone who can actually produce it. list_staff tells you what each person can do, not just what they know: if the answer needs to be a saved file, assign it to somebody who saves files, or you will get the document back as chat text with nowhere to put it. Say in the brief where the file should go and what it should be called.
 5. Report with message_user: what was done, what it found, what needs a decision. Lead with the answer.
 
 Hard rules:
 - Never invent a fact no specialist reported. Unverified means unverified, and you say so.
 - Never assign work nobody on staff can do. Say what would be needed instead.
-- Assume deep technical fluency. Skip explanations of basic infrastructure concepts.
+- Match the register your principal expects. Do not explain things they plainly already know.
 - Be brief. Every token you spend is your principal's money.""",
     ),
     Role(
@@ -264,6 +283,36 @@ Match register to destination: an internal Slack message is not a customer email
 When the brief is missing something you need - audience, ask, a name, a number - write the draft with a marked [TK: ...] placeholder. Never invent a fact to make a sentence land.""",
     ),
     Role(
+        id="hr",
+        name="Wren",
+        title="People Ops",
+        emoji="🪪",
+        color="#9b8fd4",
+        desk=(13, 10),
+        # Designing an employee is the one job here where the cost of a bad
+        # result is paid on every task that employee ever runs.
+        model="opus",
+        effort="medium",
+        max_turns=10,
+        office_tools=_WORKER_TOOLS + ("list_staff", "list_skills", "hire_employee"),
+        persona="""You are Wren, People Ops. You design and hire the specialists this office needs.
+
+When someone describes work they want done, you turn it into an employee:
+
+1. Call list_staff first. If someone here already covers the job, hire nobody and say who. A second person doing Ada's job makes the office worse, not better.
+2. Call list_skills to see what an employee can actually be given. You may only grant what it lists.
+3. If the brief leaves something you genuinely cannot infer - what the job is, what "done" looks like, whether it must touch the machine - ask once with ask_human. One question, the smallest one that unblocks you. Never interrogate.
+4. Hire with hire_employee. Your principal approves or declines it; a decline is an answer, not a failure.
+
+Writing the persona is the real work. It is the entire system prompt that employee will ever have, and it is re-sent on every request they run, so it must be complete and it must be tight. Write {principal} wherever you would otherwise name your principal's job - it is substituted per office, and a persona that hardcodes one profession only ever fits one office. Write it in the second person, addressed to them: who they are, what they own, how they work, what they refuse to do, and what their finished output looks like. Give them a length limit. Specifics beat adjectives - "quote the log line that convinced you" is worth more than "be thorough". Aim for 120-250 words.
+
+Tools: grant the smallest surface that can do the job. Every definition is re-sent on every request, so an unused tool is a permanent tax. note, ask_human and finish are the baseline for any worker. Read, Grep, Glob, WebSearch and WebFetch run immediately. Bash, Write and Edit can change this machine and every single use stops for your principal's approval - grant them only when the job cannot be done otherwise, and say so plainly when you do.
+
+Model: haiku for triage and lookups, sonnet for real work, opus only when the job is genuinely hard reasoning. Effort low unless the work needs deliberation. max_turns caps tool round trips: 5 for a fetch, 8 for normal work, more only with a reason.
+
+Report what you hired, what you granted, and one line on why. If you hired nobody, say what you would need instead.""",
+    ),
+    Role(
         id="analyst",
         name="Vera",
         title="Analysis",
@@ -280,15 +329,128 @@ State assumptions before conclusions. Be explicit about what the data cannot tel
 
 Files go to the workspace. Write a chart only when it genuinely reads better than three numbers in a sentence.""",
     ),
+    Role(
+        id="critic",
+        name="Sol",
+        title="Red Team",
+        emoji="⚖️",
+        color="#8f4a5a",
+        desk=(21, 10),
+        effort="medium",
+        office_tools=_WORKER_TOOLS,
+        native_tools=("Read", "Grep", "WebSearch", "WebFetch"),
+        persona="""You are Sol. Your job is to break things before reality does.
+
+When you are handed a finding, a plan or a draft, you do not improve it. You attack it:
+
+- What would have to be true for this to be wrong? Is it?
+- What does the evidence actually support, as against what is being read into it?
+- What is the strongest version of the opposite conclusion?
+- What was left out because it was inconvenient, or merely boring?
+
+Rank what you find. Lead with the objection that would actually change the decision, not the one that is easiest to make. Quote the specific line, number or claim you are attacking - an objection without a target is just a mood.
+
+If something survives, say so plainly and stop. A critic who always finds five problems is a critic nobody can calibrate against, and "this holds" is a complete answer. Never soften a real objection to be agreeable, and never manufacture one to look rigorous.
+
+Under 200 words.""",
+    ),
 )
 
-ROLES = {r.id: r for r in ROSTER}
+ROLE_DEFS = {r.id: r for r in _ROLE_LIST}
+
+# -- staff packs -----------------------------------------------------------
+# Miles and Wren are the machinery of the office, not its subject matter: one
+# delegates, one hires. They are in every pack. Everything else is a choice the
+# owner makes on first run, which is the whole point of shipping this to
+# somebody whose job is not the job it was built for.
+CORE_IDS = ("manager", "hr")
+
+PACKS = {
+    "empty": {
+        "name": "Empty office",
+        "blurb": "Just Miles and Wren. Describe the work you need and Wren "
+                 "designs the staff for it, one hire at a time.",
+        "principal": "one person: your principal. Assume competence and skip "
+                     "basic explanation",
+        "staff": (),
+    },
+    "devops": {
+        "name": "Infrastructure team",
+        "blurb": "Production debugging, pipelines, and the paperwork around "
+                 "them. The office this was originally built for.",
+        "principal": "one person: your principal, a DevOps engineer. Assume "
+                     "deep technical fluency and skip basic infrastructure "
+                     "explanation",
+        "staff": ("sre", "pipeline", "comms", "researcher", "scheduler",
+                  "writer", "analyst"),
+    },
+    "studio": {
+        "name": "Solo studio",
+        "blurb": "Inbox, calendar, drafts and numbers — the back office of a "
+                 "one-person business, without the infrastructure roles.",
+        "principal": "one person: your principal, who runs a small independent "
+                     "business alone. Be concrete and practical, and never "
+                     "assume they have staff to hand work to",
+        "staff": ("comms", "scheduler", "writer", "analyst", "researcher"),
+    },
+    "research": {
+        "name": "Research desk",
+        "blurb": "Find it, check it, argue with it, write it up. Pairs a "
+                 "researcher with someone whose job is to disagree.",
+        "principal": "one person: your principal, who does knowledge work and "
+                     "cares more about being right than being reassured",
+        "staff": ("researcher", "critic", "analyst", "writer", "scheduler"),
+    },
+}
+# Set OFFICE_PACK to skip the first-run screen entirely - a provisioned or
+# headless install should not need a browser open to finish starting.
+DEFAULT_PACK = os.environ.get("OFFICE_PACK", "").strip().lower()
+
+# Kept as a name because roster.py and the seed migration both read it. It is
+# only ever the fallback now; the chosen pack is stored in the database.
+DEFAULT_ROSTER = _ROLE_LIST
+
 MANAGER_ID = "manager"
-STAFF_IDS = tuple(r.id for r in ROSTER if r.id != MANAGER_ID)
+
+# Desks the floor plan actually has room for. Each entry is the middle tile of
+# a three-tile desk; the seat is the tile below it. These must stay inside the
+# open-plan area drawn by MAP in web/office.js - a desk in a wall strands its
+# occupant - so new hires are placed here rather than anywhere they like.
+DESK_SLOTS = (
+    (13, 5), (17, 5), (21, 5), (25, 5),
+    (13, 10), (17, 10), (21, 10),
+    (13, 14), (17, 14), (21, 14), (25, 14),
+    (13, 18), (17, 18), (21, 18),
+)
+
+# What the GUI is allowed to offer when editing an employee.
+MODEL_CHOICES = ("", "haiku", "sonnet", "opus")
+EFFORT_CHOICES = ("low", "medium", "high")
+# Claude Code built-ins. The read-only ones are pre-approved in llm.py; the
+# rest fall through to the approval gate, which is why handing someone Bash or
+# Write is a real decision rather than a checkbox.
+NATIVE_TOOL_CHOICES = ("Read", "Grep", "Glob", "WebSearch", "WebFetch",
+                       "Bash", "Write", "Edit")
+
+
+# The live roster is owned by office/roster.py and persisted in SQLite; these
+# names stay readable as config.ROSTER / config.ROLES / config.STAFF_IDS so
+# every existing call site keeps working while the staff changes underneath.
+def __getattr__(name):
+    if name in ("ROSTER", "ROLES", "STAFF_IDS"):
+        from . import roster as _roster
+        active = _roster.snapshot()
+        if name == "ROSTER":
+            return active
+        if name == "ROLES":
+            return {r.id: r for r in active}
+        return tuple(r.id for r in active if r.id != MANAGER_ID)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def role(agent_id: str) -> Role:
-    return ROLES[agent_id]
+    from . import roster as _roster
+    return _roster.get(agent_id)
 
 
 def validate() -> list:

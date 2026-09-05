@@ -7,14 +7,71 @@
 #   ./officectl status
 #   ./officectl logs      tail -f
 #   ./officectl setup     create the venv and install dependencies
+#   ./officectl export [name]   save this office to ~/.digital-office
+#   ./officectl import <name>   restore one, yours or a shipped template
+#   ./officectl offices         list what you can import
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 VENV=".venv"
 PY="$VENV/bin/python"
-PID="data/office.pid"
-LOG="data/office.log"
+
+# Settings live in .env next to this script. Without this the daemon only ever
+# sees the environment of whichever shell happened to launch it, which means a
+# fresh terminal silently starts an office with no credentials.
+# Parsed rather than sourced: a config file should not be able to run commands.
+load_env() {
+  [ -f .env ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    key=$(printf '%s' "$key" | tr -d ' \t')
+    case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    # strip one layer of matching quotes, and any trailing carriage return
+    value=${value%$'\r'}
+    case "$value" in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    # Anything already exported wins, so a one-off override still works:
+    #   OFFICE_BACKEND=mock ./officectl run
+    if [ -z "$(eval "printf '%s' \"\${$key-}\"")" ]; then
+      export "$key=$value"
+    fi
+  done < .env
+}
+load_env
+
+# Derived AFTER load_env, because the daemon writes its pid and log under
+# OFFICE_DATA_DIR. Hardcoding data/ here meant `stop` looked in the wrong place
+# the moment that variable was set, and silently reported "not running" at a
+# live daemon.
+# Your saved offices live outside the project, so they survive a git pull, a
+# re-clone, or deleting the checkout entirely. The offices/ directory inside
+# the repo is shipped templates - product content, not your data.
+OFFICE_HOME="${OFFICE_HOME:-$HOME/.digital-office}"
+SAVED="$OFFICE_HOME/offices"
+TEMPLATES="offices"
+
+# Resolve an office argument: an explicit path wins, then one of your saved
+# offices by name, then a shipped template by name.
+resolve_office() {
+  case "$1" in
+    */*|*.json) printf '%s' "$1"; return ;;
+  esac
+  if [ -f "$SAVED/$1.json" ]; then printf '%s' "$SAVED/$1.json"
+  elif [ -f "$TEMPLATES/$1.json" ]; then printf '%s' "$TEMPLATES/$1.json"
+  else printf '%s' "$1"
+  fi
+}
+
+DATA="${OFFICE_DATA_DIR:-data}"
+WORK="${OFFICE_WORKSPACE:-workspace}"
+PID="$DATA/office.pid"
+LOG="$DATA/office.log"
 
 # Python 3.10+ is required by claude-agent-sdk. macOS system python is 3.9.
 pick_python() {
@@ -35,7 +92,11 @@ setup() {
   [ -d "$VENV" ] || "$py" -m venv "$VENV"
   "$PY" -m pip install --quiet --upgrade pip
   "$PY" -m pip install --quiet -r requirements.txt
-  mkdir -p data workspace
+  mkdir -p "$DATA" "$WORK"
+  if [ ! -f .env ] && [ -f deploy/office.env.example ]; then
+    cp deploy/office.env.example .env
+    echo "wrote .env - put your credentials in it before starting"
+  fi
   echo "ready. now run: ./officectl start"
 }
 
@@ -54,7 +115,7 @@ case "${1:-}" in
   start)
     [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
     if running; then echo "already running (pid $(cat "$PID"))"; exit 0; fi
-    mkdir -p data
+    mkdir -p "$DATA"
     nohup "$PY" -m office.daemon >>"$LOG" 2>&1 &
     sleep 1.5
     if running; then
@@ -92,8 +153,83 @@ case "${1:-}" in
 
   logs) tail -f "$LOG" ;;
 
+  offices)
+    echo "yours   ($SAVED)"
+    found=0
+    for f in "$SAVED"/*.json; do
+      [ -f "$f" ] || continue
+      echo "  $(basename "$f" .json)"; found=1
+    done
+    [ "$found" = 1 ] || echo "  (none yet - ./officectl export <name>)"
+    echo "shipped ($TEMPLATES)"
+    for f in "$TEMPLATES"/*.json; do
+      [ -f "$f" ] || continue
+      echo "  $(basename "$f" .json)"
+    done
+    ;;
+
+  export)
+    # Works whether or not the daemon is up: a stopped office is exactly the
+    # one you most want to be able to back up.
+    mkdir -p "$SAVED"
+    case "${2:-}" in
+      "")          target="$SAVED/office-$(date +%Y%m%d-%H%M).json" ;;
+      */*|*.json)  target="$2" ;;
+      *)           target="$SAVED/$2.json" ;;
+    esac
+    if running; then
+      url="http://${OFFICE_HOST:-127.0.0.1}:${OFFICE_PORT:-8765}/api/export"
+      if [ -n "${OFFICE_TOKEN:-}" ]; then
+        curl -fsS -H "X-Office-Token: $OFFICE_TOKEN" "$url" > "$target"
+      else
+        curl -fsS "$url" > "$target"
+      fi
+    else
+      [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
+      "$PY" -c 'import json,sys
+from office.store import Store
+from office import roster
+store = Store()
+roster.refresh(store)
+json.dump(roster.export_office(store), sys.stdout, indent=2)' > "$target"
+    fi
+    echo "wrote $target"
+    ;;
+
+  import)
+    [ -n "${2:-}" ] || {
+      echo "usage: ./officectl import <name|file.json>  (see ./officectl offices)" >&2
+      exit 1; }
+    file="$(resolve_office "$2")"
+    [ -f "$file" ] || { echo "no such office: $2" >&2; exit 1; }
+    echo "importing $file"
+    if running; then
+      url="http://${OFFICE_HOST:-127.0.0.1}:${OFFICE_PORT:-8765}/api/import"
+      if [ -n "${OFFICE_TOKEN:-}" ]; then
+        curl -fsS -X POST -H "Content-Type: application/json" \
+             -H "X-Office-Token: $OFFICE_TOKEN" --data-binary "@$file" "$url"
+      else
+        curl -fsS -X POST -H "Content-Type: application/json" \
+             --data-binary "@$file" "$url"
+      fi
+      echo
+    else
+      [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
+      "$PY" -c 'import json,sys
+from office.store import Store
+from office import roster
+store = Store()
+roster.refresh(store)
+doc = json.load(open(sys.argv[1]))
+installed, retired = roster.import_office(store, doc)
+print("installed:", ", ".join(installed))
+if retired:
+    print("retired  :", ", ".join(retired))' "$file"
+    fi
+    ;;
+
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

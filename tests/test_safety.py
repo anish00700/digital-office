@@ -10,6 +10,9 @@ import sys
 import tempfile
 
 os.environ.setdefault("OFFICE_BACKEND", "mock")
+# A fresh office seeds only Miles and Wren; the domain staff are a first-run
+# choice. Name the pack so these tests get the team they delegate to.
+os.environ.setdefault("OFFICE_PACK", "devops")
 _TMP = tempfile.mkdtemp(prefix="office-test-")
 os.environ["OFFICE_DATA_DIR"] = os.path.join(_TMP, "data")
 os.environ["OFFICE_WORKSPACE"] = os.path.join(_TMP, "workspace")

@@ -82,6 +82,28 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_by TEXT,
     fired INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS roster (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    color TEXT NOT NULL,
+    desk_x INTEGER NOT NULL,
+    desk_y INTEGER NOT NULL,
+    persona TEXT NOT NULL,
+    office_tools TEXT NOT NULL DEFAULT '[]',
+    native_tools TEXT NOT NULL DEFAULT '[]',
+    model TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT 'low',
+    max_turns INTEGER NOT NULL DEFAULT 8,
+    reports_to TEXT NOT NULL DEFAULT 'manager',
+    active INTEGER NOT NULL DEFAULT 1,
+    hired_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -128,6 +150,46 @@ class Store:
             self.db.commit()
             return out
 
+    # -- settings ----------------------------------------------------------
+    # Office-level configuration the owner sets once, in the GUI, and which
+    # therefore cannot live in environment variables.
+    def setting(self, key, default=None):
+        row = self._run("SELECT value FROM settings WHERE key=?", (key,), fetch="one")
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self._run("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                  (key, str(value)))
+
+    # -- roster ------------------------------------------------------------
+    # Who works here is state, not source. The table is seeded from
+    # config.DEFAULT_ROSTER on first boot and owned by the office after that,
+    # so hiring someone survives a restart the same way a task does.
+    def roster_rows(self, include_departed=False):
+        sql = "SELECT * FROM roster"
+        if not include_departed:
+            sql += " WHERE active=1"
+        return self._run(sql + " ORDER BY hired_at", fetch="all")
+
+    def roster_count(self):
+        row = self._run("SELECT COUNT(*) n FROM roster", fetch="one") or {}
+        return row.get("n") or 0
+
+    def write_role(self, row):
+        """Insert or replace one roster row. `row` is a plain dict of columns."""
+        cols = ("id", "name", "title", "emoji", "color", "desk_x", "desk_y",
+                "persona", "office_tools", "native_tools", "model", "effort",
+                "max_turns", "reports_to", "active", "hired_at")
+        self._run(
+            f"INSERT OR REPLACE INTO roster ({','.join(cols)})"
+            f" VALUES ({','.join('?' * len(cols))})",
+            tuple(row[c] for c in cols),
+        )
+
+    def set_role_active(self, agent_id, active):
+        self._run("UPDATE roster SET active=? WHERE id=?",
+                  (1 if active else 0, agent_id))
+
     # -- agents ------------------------------------------------------------
     def ensure_agents(self, ids):
         now = time.time()
@@ -140,6 +202,13 @@ class Store:
         self._run(
             "UPDATE agents SET status='idle', detail='', current_task=NULL, updated_at=?",
             (now,),
+        )
+
+    def ensure_agent(self, agent_id):
+        """Add one agent row without disturbing anyone else's live status."""
+        self._run(
+            "INSERT OR IGNORE INTO agents (id, status, updated_at) VALUES (?, 'idle', ?)",
+            (agent_id, time.time()),
         )
 
     def set_agent(self, agent_id, status, detail="", task_id=None):
