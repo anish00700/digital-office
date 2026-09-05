@@ -189,15 +189,20 @@ class AgentSDKBackend:
                                      args=_short_args(getattr(block, "input", {})))
                 elif kind == "ResultMessage":
                     turn.stop = getattr(message, "terminal_reason", "") or "stop"
-                    cost = getattr(message, "cost", None)
-                    if cost is not None:
-                        turn.cost_usd = getattr(cost, "total_cost_usd", 0.0) or 0.0
+                    # ResultMessage carries total_cost_usd directly, and `usage`
+                    # is a plain dict - not a nested cost object with attributes.
+                    # Reading it the other way silently recorded zeroes for
+                    # every turn, which left the spend counter permanently $0.00
+                    # and the daily budget guard unable to ever fire.
+                    turn.cost_usd = getattr(message, "total_cost_usd", None) or 0.0
                     usage = getattr(message, "usage", None)
-                    if usage is not None:
-                        turn.input_tokens = getattr(usage, "input_tokens", 0) or 0
-                        turn.output_tokens = getattr(usage, "output_tokens", 0) or 0
-                        turn.cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-                        turn.cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    if usage:
+                        pull = (usage.get if isinstance(usage, dict)
+                                else lambda k, d=0: getattr(usage, k, d))
+                        turn.input_tokens = pull("input_tokens", 0) or 0
+                        turn.output_tokens = pull("output_tokens", 0) or 0
+                        turn.cache_read = pull("cache_read_input_tokens", 0) or 0
+                        turn.cache_write = pull("cache_creation_input_tokens", 0) or 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
