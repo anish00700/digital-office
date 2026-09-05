@@ -182,6 +182,19 @@ OFFICE_BACKEND=mock ./officectl run
 
 Other commands: `stop`, `restart`, `status`, `logs`, `run` (foreground).
 
+## Tests
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto
+```
+
+`tests/test_safety.py` covers the two paths where a mistake is expensive - the
+shell allowlist and the human-approval round trip. `tests/test_office.py`
+covers the mutable parts: the roster and its validation, staff packs,
+export/import, the shared context file under concurrent writers, and usage
+aggregation.
+
 ## Credentials
 
 The default backend is the **Claude Agent SDK**, which bundles its own Claude Code
