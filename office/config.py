@@ -8,8 +8,12 @@ that costs money has a cheap default; see BUDGET notes on each field.
 """
 
 import os
+import re
+import zoneinfo
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import vault
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -20,6 +24,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 ROOT = Path(__file__).resolve().parent.parent
+# Before any other setting is read: secrets from .env land in a registry that
+# is never exported, everything else lands in the environment (setdefault, so
+# an explicit export still wins). See office/vault.py.
+DOTENV_KEYS = vault.load_dotenv(ROOT / ".env")
 DATA_DIR = Path(os.environ.get("OFFICE_DATA_DIR", ROOT / "data"))
 WORKSPACE = Path(os.environ.get("OFFICE_WORKSPACE", ROOT / "workspace"))
 WEB_DIR = ROOT / "web"
@@ -32,7 +40,7 @@ PID_PATH = DATA_DIR / "office.pid"
 # Binding anywhere else without OFFICE_TOKEN set is refused at startup.
 HOST = os.environ.get("OFFICE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OFFICE_PORT", "8765"))
-TOKEN = os.environ.get("OFFICE_TOKEN", "").strip()
+TOKEN = (vault.secret("OFFICE_TOKEN", "") or "").strip()
 
 # -- backend ---------------------------------------------------------------
 # agentsdk : Claude Agent SDK (bundles its own Claude Code binary). Uses
@@ -63,6 +71,29 @@ SESSION_WINDOW_S = int(os.environ.get("OFFICE_SESSION_WINDOW", str(5 * 3600)))
 APPROVAL_TIMEOUT_S = int(os.environ.get("OFFICE_APPROVAL_TIMEOUT", "900"))
 # Tool results are the biggest silent token sink in an agent loop. Truncate.
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("OFFICE_MAX_TOOL_RESULT", "4000"))
+
+# -- production knobs --------------------------------------------------------
+# How many model calls may run at once. A burst of nine assignments on a plan
+# whose limits are sized for one person typing is a burst of 429s; this
+# smooths it. Workers past the limit show "waiting for a free model slot".
+MAX_CONCURRENT = max(1, int(os.environ.get("OFFICE_MAX_CONCURRENT", "3")))
+# Events and transcripts older than this are pruned nightly. Usage rows are
+# kept: they are the ledger, and they are small.
+RETENTION_DAYS = max(1, int(os.environ.get("OFFICE_RETENTION_DAYS", "30")))
+# IANA zone for "now", reminders and routines. A VPS defaults to UTC, which is
+# the wrong answer for "remind me at 8am" every single time.
+_tz_name = os.environ.get("OFFICE_TZ", "").strip()
+try:
+    TZ = zoneinfo.ZoneInfo(_tz_name) if _tz_name else None
+except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+    TZ = None
+# Keep the Agent SDK away from the human's ~/.claude: no personal settings.json
+# allow-rules leaking past the approval gate, no personal plugins or skills in
+# the context window. Only possible when the credential is in the environment
+# (a `claude login` on the box stores it under ~/.claude, which we would hide).
+ISOLATE_CLAUDE_CONFIG = os.environ.get("OFFICE_ISOLATE_CLAUDE_CONFIG", "1").strip() \
+    not in ("0", "false", "no", "off")
+CLAUDE_CONFIG_DIR = DATA_DIR / "claude"
 
 # -- who this office works for ---------------------------------------------
 # Personas write {principal} rather than naming a profession, and it is
@@ -102,9 +133,13 @@ CACHE_WRITE_MULTIPLIER = 1.25
 # Shell commands matching these prefixes run without asking. Everything else
 # raises an approval request in the GUI. Read-only by design: if you widen this
 # list you own the consequences.
+#
+# `env`, `printenv` and `ps` are deliberately absent. They are read-only and
+# they are also the three fastest ways to print every credential this process
+# holds. Read-only is not the same as safe when the output enters a model.
 SHELL_AUTO_ALLOW = (
     "ls", "cat", "head", "tail", "wc", "file", "stat", "pwd", "date", "uptime",
-    "df", "du", "ps", "whoami", "env", "which", "uname", "hostname", "free",
+    "df", "du", "whoami", "which", "uname", "hostname", "free",
     "git status", "git log", "git diff", "git branch", "git remote", "git show",
     "kubectl get", "kubectl describe", "kubectl logs", "kubectl top",
     "kubectl config get-contexts", "kubectl config current-context",
@@ -116,6 +151,104 @@ SHELL_AUTO_ALLOW = (
     "aws sts get-caller-identity", "systemctl status", "journalctl",
     "dig", "nslookup", "ping -c",
 )
+
+# An auto-approved command whose *arguments* name any of these goes to you
+# instead. `cat` is harmless; `cat ~/.ssh/id_ed25519` is not. Substring match,
+# case-insensitive, on every token of the command - a false positive costs one
+# approval click, a false negative costs a key.
+SHELL_DENY_PATHS = (
+    ".env", "/.ssh", "/.claude", "/.aws", "/.kube", "/.docker", "/.gnupg",
+    "/.netrc", "/.config/gh", "/proc/", "/etc/shadow", "/etc/sudoers",
+    ".pem", ".key", ".p12", ".pfx", "id_rsa", "id_ed25519", "id_ecdsa",
+    "credential", "secret", "token", "password", "passwd", "office.db",
+)
+
+# What the agent subprocess may see of this process's environment. Everything
+# else - SLACK_TOKEN, MAIL_PASSWORD, OFFICE_TOKEN, anything that looks like a
+# secret - is withheld, so `env` inside an agent shell is not a credential dump.
+#
+# The one exception that cannot be closed: the credential the agent itself
+# runs on (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) must reach the SDK's
+# process. An approved shell command can read it. That is the residual risk of
+# an LLM with Bash, and it is why Bash never auto-approves anything but the
+# read-only list above.
+ENV_BASELINE = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TZ", "TMPDIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "PYTHONIOENCODING", "PYTHONUNBUFFERED", "VIRTUAL_ENV",
+    "CLAUDE_CONFIG_DIR",
+)
+# Non-secret tool configuration your agents commonly need. Extend with
+# OFFICE_ENV_PASSTHROUGH=NAME,NAME. Names that look like secrets are refused
+# even if you list them - put AWS keys in ~/.aws/credentials, not the env.
+ENV_PASSTHROUGH_DEFAULT = (
+    "KUBECONFIG", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "ANSIBLE_CONFIG", "ANSIBLE_INVENTORY", "DOCKER_HOST", "DOCKER_CONTEXT",
+    # Lets git-over-ssh use your loaded keys. Every git command that pushes is
+    # behind an approval card; remove this if that is still too much.
+    "SSH_AUTH_SOCK",
+)
+ENV_PASSTHROUGH = tuple(
+    n.strip() for n in os.environ.get("OFFICE_ENV_PASSTHROUGH", "").split(",") if n.strip()
+) + ENV_PASSTHROUGH_DEFAULT
+SECRET_ENV_PATTERN = vault.SECRET_PATTERN
+_SDK_PREFIXES = vault.SDK_PREFIXES
+
+
+def agent_environment(source=None) -> dict:
+    """The environment handed to an agent's subprocess. Allowlist, never the
+    inherited one. `source` is for tests; defaults to os.environ."""
+    source = os.environ if source is None else source
+    out = {}
+    for name, value in source.items():
+        if name.startswith(_SDK_PREFIXES):
+            out[name] = value                      # the SDK's own config + credential
+        elif name in ENV_BASELINE or name in ENV_PASSTHROUGH:
+            if not SECRET_ENV_PATTERN.search(name):
+                out[name] = value
+    if ISOLATE_CLAUDE_CONFIG and "CLAUDE_CONFIG_DIR" not in out and _credential_in_env(source):
+        out["CLAUDE_CONFIG_DIR"] = str(CLAUDE_CONFIG_DIR)
+    return out
+
+
+def _credential_in_env(source) -> bool:
+    return any(source.get(k) for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                                       "ANTHROPIC_AUTH_TOKEN"))
+
+
+def names_secret_path(command: str) -> bool:
+    """True if any token of the command mentions a path fragment from
+    SHELL_DENY_PATHS. Applied before auto-approval, never to block outright."""
+    tokens = (command or "").lower().split()
+    return any(frag in tok for tok in tokens for frag in SHELL_DENY_PATHS)
+
+
+# The office's own credentials live in office/vault.py. Re-exported so callers
+# write config.secret("SLACK_TOKEN") and tests can inspect config._SECRETS.
+SECRET_NAMES = vault.OFFICE_SECRET_NAMES
+_SECRETS = vault._REGISTRY
+secret = vault.secret
+
+
+def scrub_process_environment() -> list:
+    """Remove from THIS process's environment everything an agent must not
+    see, after copying the office's own secrets aside.
+
+    Why here rather than `ClaudeAgentOptions.env`: the SDK builds the agent's
+    environment as {**os.environ, **options.env} - a merge - so a scrubbed
+    `env=` removes nothing. The daemon's environment is the only one that
+    reaches an agent, so the daemon's environment is what gets cleaned.
+    Returns the names dropped. Never the values."""
+    keep = agent_environment(os.environ)
+    dropped = sorted(n for n in os.environ if n not in keep)
+    for name in dropped:
+        if vault.is_secret_name(name):
+            vault.capture(name)        # the office may still need it
+        del os.environ[name]           # also unsetenv(): children inherit the cleaned env
+    return dropped
 
 
 @dataclass(frozen=True)

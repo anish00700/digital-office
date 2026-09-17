@@ -20,11 +20,13 @@ import time
 import urllib.parse
 import urllib.request
 
+from .. import config
+
 API = "https://slack.com/api"
 
 
 def _configured():
-    return bool(os.environ.get("SLACK_TOKEN"))
+    return bool(config.secret("SLACK_TOKEN"))
 
 
 def _call(method, token, **params):
@@ -35,13 +37,13 @@ def _call(method, token, **params):
 
 
 async def fetch(since_hours=12):
-    token = os.environ.get("SLACK_TOKEN")
+    token = config.secret("SLACK_TOKEN")
     if not token:
         return ("Slack is not configured. Set SLACK_TOKEN to enable this desk. "
                 "Report this to your principal rather than guessing at content.")
 
     oldest = time.time() - since_hours * 3600
-    channels = [c for c in os.environ.get("SLACK_CHANNELS", "").split(",") if c.strip()]
+    channels = [c for c in config.secret("SLACK_CHANNELS", "").split(",") if c.strip()]
 
     try:
         if not channels:

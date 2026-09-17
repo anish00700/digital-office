@@ -39,6 +39,12 @@ load_env() {
     # Anything already exported wins, so a one-off override still works:
     #   OFFICE_BACKEND=mock ./officectl run
     if [ -z "$(eval "printf '%s' \"\${$key-}\"")" ]; then
+      # Secret-shaped keys never enter the shell environment: the daemon reads
+      # them from .env itself (office/vault.py), so they are absent from every
+      # process's exec-time environment block, the thing `ps e` prints.
+      case "$key" in
+        *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*_KEY|*API_KEY*|*ACCESS_KEY*|*CREDENTIAL*|*PRIVATE*) continue ;;
+      esac
       export "$key=$value"
     fi
   done < .env
@@ -116,7 +122,10 @@ case "${1:-}" in
     [ -x "$PY" ] || { echo "run ./officectl setup first" >&2; exit 1; }
     if running; then echo "already running (pid $(cat "$PID"))"; exit 0; fi
     mkdir -p "$DATA"
-    nohup "$PY" -m office.daemon >>"$LOG" 2>&1 &
+    # The daemon writes and rotates data/office.log itself; sending stdout there
+    # too doubled every line and fought the rotation. Only the banner and any
+    # crash before logging starts land in daemon.out, which stays tiny.
+    nohup "$PY" -m office.daemon >>"data/daemon.out" 2>&1 &
     sleep 1.5
     if running; then
       echo "office open at http://${OFFICE_HOST:-127.0.0.1}:${OFFICE_PORT:-8765} (pid $(cat "$PID"))"

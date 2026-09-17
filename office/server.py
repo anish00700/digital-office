@@ -82,6 +82,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route = urllib.parse.urlparse(self.path).path
         if route == "/api/health":
+            # Liveness is unauthenticated so a proxy or watchdog can poll it;
+            # the detailed view (queue depths, worker names) needs the token.
+            if self._authorized():
+                return self._json(self.office.health())
             return self._json({"ok": True, "backend": self.office.backend.name})
         if not self._authorized():
             return self._send(401, LOGIN_PAGE, "text/html; charset=utf-8")

@@ -51,7 +51,9 @@ async def _finish(args, ctx):
 
 
 async def _now(args, ctx):
-    now = dt.datetime.now().astimezone()
+    # config.TZ is None when OFFICE_TZ is unset, which means "the machine's
+    # zone" - on a VPS that is usually UTC, and usually not what you meant.
+    now = dt.datetime.now(config.TZ) if config.TZ else dt.datetime.now().astimezone()
     return now.strftime("%Y-%m-%d %H:%M %Z (%A)")
 
 
@@ -88,7 +90,10 @@ def _parse_when(when):
         return time.time() + n * mult if mult else None
     for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return dt.datetime.strptime(when, fmt).timestamp()
+            parsed = dt.datetime.strptime(when, fmt)
+            if config.TZ:
+                parsed = parsed.replace(tzinfo=config.TZ)
+            return parsed.timestamp()
         except ValueError:
             continue
     return None
@@ -414,6 +419,10 @@ def _is_auto_allowed_shell(command):
     # Chained commands defeat prefix matching, so refuse to auto-approve them.
     if any(sep in cmd for sep in ("&&", "||", ";", "|", ">", "<", "`", "$(")):
         return False
+    # A read-only command pointed at a secret is not read-only in any sense
+    # that matters once its output is in a model's context.
+    if config.names_secret_path(cmd):
+        return False
     return any(cmd == p or cmd.startswith(p + " ") for p in config.SHELL_AUTO_ALLOW)
 
 
@@ -442,7 +451,10 @@ async def permission_gate(ctx, tool_name, input_data, _context):
         if _is_auto_allowed_shell(command):
             ctx.emit("tool", tool="bash", args=command[:160])
             return PermissionResultAllow(updated_input=input_data)
-        ok = await ctx.request_approval("shell", command, detail=ctx.task_title)
+        detail = ctx.task_title
+        if config.names_secret_path(command):
+            detail = f"⚠ names a secret path · {ctx.task_title}"
+        ok = await ctx.request_approval("shell", command, detail=detail)
         if ok:
             return PermissionResultAllow(updated_input=input_data)
         return PermissionResultDeny(message="Your principal declined this command.")

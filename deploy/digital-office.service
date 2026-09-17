@@ -33,8 +33,11 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
-StandardOutput=append:/opt/digital-office/data/office.log
-StandardError=append:/opt/digital-office/data/office.log
+# The daemon rotates its own data/office.log (10 MB x 5). Sending stdout there
+# too would fight the rotation, so the journal gets the copy instead:
+#   journalctl -u digital-office -f
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

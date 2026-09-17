@@ -70,6 +70,9 @@ class Office:
         self._workers = []
         self._staff_tasks = {}      # agent_id -> its worker task, so we can fire one
         self._paused_reason = ""
+        # One gate for every model call; see config.MAX_CONCURRENT.
+        self._model_slots = asyncio.Semaphore(config.MAX_CONCURRENT)
+        self._last_prune = 0.0
         self.social = SocialLife(self)
 
     # -- lifecycle ------------------------------------------------------
@@ -87,10 +90,59 @@ class Office:
         ]
         for rid in config.STAFF_IDS:
             self._spawn_worker(rid)
+        self._recover_tasks()
         self.bus.publish("office.started", backend=self.backend.name,
                          auth=self.backend.describe_auth())
-        log.info("office open - backend=%s auth=%s", self.backend.name,
-                 self.backend.describe_auth())
+        log.info("office open - backend=%s auth=%s concurrency=%d tz=%s",
+                 self.backend.name, self.backend.describe_auth(),
+                 config.MAX_CONCURRENT, config.TZ or "system")
+
+    def _recover_tasks(self):
+        """A daemon that died mid-task leaves rows stuck in `running`, and
+        `queued` rows nobody holds. Requeue both in creation order. The
+        manager's in-flight conversation is not recoverable - it lived in a
+        model session that is gone - so tell the user what was re-run."""
+        rows = self.store.tasks_by_status(("running", "queued"))
+        requeued, dropped = [], 0
+        for row in rows:
+            if row["assignee"] not in self.queues:
+                self.store.update_task(row["id"], status="failed",
+                                       error=f"{row['assignee']} is no longer on staff",
+                                       finished_at=time.time())
+                dropped += 1
+                continue
+            if row["status"] == "running":
+                self.store.update_task(row["id"], status="queued", started_at=None)
+                self.bus.publish("task.updated", agent_id=row["assignee"],
+                                 task_id=row["id"], status="queued")
+            self._task_events[row["id"]] = asyncio.Event()
+            self.queues[row["assignee"]].put_nowait(row["id"])
+            requeued.append(row["title"])
+        if requeued or dropped:
+            self.bus.publish("office.recovered", requeued=len(requeued), dropped=dropped)
+            names = "; ".join(t[:40] for t in requeued[:5])
+            more = f" (+{len(requeued) - 5} more)" if len(requeued) > 5 else ""
+            self._say_to_user(
+                f"The office restarted. I re-queued {len(requeued)} task(s) that were "
+                f"in progress: {names}{more}." if requeued else
+                f"The office restarted; {dropped} task(s) belonged to staff who have left.")
+            log.info("recovered %d task(s), dropped %d", len(requeued), dropped)
+
+    def health(self):
+        """Deep health for a watchdog or a human: is the loop alive, are the
+        workers, how deep are the queues, when did anything last happen."""
+        now = time.time()
+        return {
+            "ok": True,
+            "backend": self.backend.name,
+            "paused": self._paused_reason or None,
+            "uptime_s": round(now - self.started_at),
+            "workers_alive": {aid: (not t.done()) for aid, t in self._staff_tasks.items()},
+            "queue_depth": {aid: q.qsize() for aid, q in self.queues.items()},
+            "model_slots_free": self._model_slots._value,
+            "last_event_age_s": round(now - (self.store.last_event_ts() or self.started_at)),
+            "tz": str(config.TZ or "system"),
+        }
 
     async def stop(self):
         running = self._workers + list(self._staff_tasks.values())
@@ -321,7 +373,10 @@ class Office:
                                  status="failed")
                 self._on_failure(agent_id, task_id, str(exc))
             finally:
-                event = self._task_events.get(task_id)
+                # Set, then forget. Anyone already awaiting holds their own
+                # reference; a later `wait` finds no event and reads the
+                # finished row directly. Keeping these grew without bound.
+                event = self._task_events.pop(task_id, None)
                 if event is not None:
                     event.set()
                 self._set_status(agent_id, "idle", "")
@@ -340,7 +395,8 @@ class Office:
             return
 
         self.store.update_task(task_id, status="running", started_at=time.time())
-        self._set_status(role.id, "working", task["title"][:60], task_id)
+        # "queued" until _run_model actually holds a slot; then "working".
+        self._set_status(role.id, "queued", task["title"][:60], task_id)
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
                          status="running")
 
@@ -359,7 +415,7 @@ class Office:
             budget_usd=config.TASK_BUDGET_USD,
             cwd=str(config.WORKSPACE),
         )
-        turn = await self.backend.run(request, ctx, ctx.emit)
+        turn = await self._run_model(request, ctx)
         self._record_usage(role, turn)
 
         result = ctx.result or turn.text or "(no output)"
@@ -415,7 +471,7 @@ class Office:
             budget_usd=config.TASK_BUDGET_USD * 2,
             cwd=str(config.WORKSPACE),
         )
-        turn = await self.backend.run(request, ctx, ctx.emit)
+        turn = await self._run_model(request, ctx)
         self._record_usage(role, turn)
         # message_user is the manager's proper exit; fall back to raw text so a
         # reply is never silently swallowed.
@@ -454,27 +510,61 @@ class Office:
                 "total": self.store.spend(),
             })
 
+    async def _run_model(self, request, ctx):
+        """Every model call passes through one semaphore. On a subscription the
+        limits are sized for one person typing; nine agents starting at once is
+        how you meet the 5-hour window at 9:04am."""
+        if self._model_slots.locked():
+            self._set_status(ctx.agent_id, "queued", "waiting for a free model slot",
+                             ctx.task_id)
+        async with self._model_slots:
+            self._set_status(ctx.agent_id, "working", (ctx.task_title or "")[:60],
+                             ctx.task_id)
+            return await self.backend.run(request, ctx, ctx.emit)
+
     def _budget_block(self):
         if self._paused_reason:
             return self._paused_reason
-        spent = self.store.spend_since(time.time() - 86400)["usd"]
+        now = time.time()
+        spent = self.store.spend_since(now - 86400)["usd"]
         if config.DAILY_BUDGET_USD and spent >= config.DAILY_BUDGET_USD:
             reason = (f"Daily budget reached (${spent:.2f} of "
                       f"${config.DAILY_BUDGET_USD:.2f} in the last 24h). "
                       "The office is paused. Raise OFFICE_DAILY_BUDGET_USD or wait.")
             self.bus.publish("office.budget", reason=reason, spend=spent)
             return reason
+        # On a subscription the dollar figure is notional; tokens per window
+        # are what the plan actually meters. This is the ceiling that counts.
+        if config.SESSION_TOKEN_BUDGET:
+            since = now - config.SESSION_WINDOW_S
+            used = self.store.usage_totals(since)["tokens"]
+            if used >= config.SESSION_TOKEN_BUDGET:
+                first = self.store.usage_first_ts(since) or now
+                resume = first + config.SESSION_WINDOW_S
+                reason = (f"Token ceiling reached: {used:,} of "
+                          f"{config.SESSION_TOKEN_BUDGET:,} in the last "
+                          f"{config.SESSION_WINDOW_S // 3600}h. Paused until about "
+                          f"{time.strftime('%H:%M', time.localtime(resume))}.")
+                self.bus.publish("office.budget", reason=reason, tokens=used,
+                                 resume_at=resume)
+                return reason
         return ""
 
     # -- background ticker -----------------------------------------------
     async def _ticker(self):
-        """Fires due reminders. Cheap: no model call unless something is due."""
+        """Fires due reminders and, once a day, prunes old rows. Never calls a
+        model: an idle office costs nothing."""
         while True:
             await asyncio.sleep(30)
             try:
                 for row in self.store.due_reminders():
                     self.store.mark_reminder_fired(row["id"])
                     self._say_to_user(f"⏰ Reminder: {row['text']}")
+                if time.time() - self._last_prune > 86400:
+                    self._last_prune = time.time()
+                    removed = self.store.prune(config.RETENTION_DAYS)
+                    if any(removed.values()):
+                        log.info("pruned %s", removed)
             except Exception:
                 log.exception("ticker failed")
 

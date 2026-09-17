@@ -148,6 +148,10 @@ class AgentSDKBackend:
             if nt in ("Read", "Grep", "Glob", "WebSearch", "WebFetch"):
                 allowed.append(nt)
 
+        # No env= here on purpose. The SDK merges options.env OVER os.environ
+        # (subprocess_cli.py: {**inherited_env, **options.env}), so passing a
+        # scrubbed dict withholds nothing. The daemon scrubs its own
+        # environment at startup instead; see config.scrub_process_environment.
         options = sdk.ClaudeAgentOptions(
             # BUDGET: a bare string, never {"preset": "claude_code"} - the
             # preset is thousands of tokens of coding-agent instructions we
@@ -169,6 +173,10 @@ class AgentSDKBackend:
             allowed_tools=allowed,
             mcp_servers={"office": server} if server else {},
             model=req.model or None,
+            # A plan that does not include opus should degrade a role to the
+            # office default rather than fail every task that role ever gets.
+            fallback_model=(config.MODEL_SMART
+                            if req.model and req.model != config.MODEL_SMART else None),
             effort=req.effort,
             max_turns=req.max_turns,
             max_budget_usd=req.budget_usd or None,
@@ -309,6 +317,15 @@ class APIBackend:
                     thinking={"type": "adaptive"},
                     output_config={"effort": req.effort},
                 )
+            except anthropic.NotFoundError as exc:
+                fallback = self._model(config.MODEL_SMART)
+                if model != fallback:
+                    on_event("say", text=f"{model} is not available here; "
+                                          f"continuing on {fallback}.")
+                    model = fallback
+                    continue                       # costs one loop iteration, fine
+                turn.error = f"model unavailable: {exc}"
+                break
             except anthropic.RateLimitError as exc:
                 turn.error = f"rate limited: {exc}"
                 break

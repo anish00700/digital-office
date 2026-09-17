@@ -238,10 +238,18 @@ def load(store):
                 store.write_role(_to_row(seated, hired_at=base + i * 0.001))
 
         # An office that predates staff packs is already set up by definition.
-        if store.roster_count() > len(config.CORE_IDS) \
-                and store.setting("setup_complete") is None:
-            store.set_setting("setup_complete", "1")
-            store.set_setting("pack", "devops")
+        # Two shapes: a roster table that already holds domain staff, or - from
+        # before the roster table existed at all - only the original hardcoded
+        # eight in `agents`. The second shape used to land on the first-run
+        # screen with everyone gone; it now gets the infrastructure pack back.
+        if store.setting("setup_complete") is None:
+            if store.roster_count() > len(config.CORE_IDS):
+                store.set_setting("setup_complete", "1")
+                store.set_setting("pack", "devops")
+            else:
+                legacy = {a["id"] for a in store.agents()} - set(config.CORE_IDS)
+                if legacy and legacy <= set(config.PACKS["devops"]["staff"]):
+                    return install_pack(store, "devops", "")
 
         # A pack named in the environment answers the first-run question
         # without a browser, for provisioned and headless installs.

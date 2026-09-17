@@ -147,13 +147,29 @@ class Store:
             self._migrate()
             self.db.commit()
 
+    # Ordered, named, recorded in `settings` as migrated:<name>. Each step must
+    # be safe to re-run, because the settings row is written after the step.
+    MIGRATIONS = (
+        ("roster.skills",
+         "ALTER TABLE roster ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'"),
+    )
+
     def _migrate(self):
         """CREATE TABLE IF NOT EXISTS never adds a column to a table that
         already exists, so anything added after the first release needs this."""
-        have = {r[1] for r in self.db.execute("PRAGMA table_info(roster)")}
-        if "skills" not in have:
+        done = {r[0] for r in self.db.execute(
+            "SELECT key FROM settings WHERE key LIKE 'migrated:%'")}
+        for name, sql in self.MIGRATIONS:
+            if f"migrated:{name}" in done:
+                continue
+            table = sql.split()[2]
+            column = sql.split("ADD COLUMN", 1)[1].split()[0] if "ADD COLUMN" in sql else None
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column is None or column not in have:
+                self.db.execute(sql)
             self.db.execute(
-                "ALTER TABLE roster ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'")
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (f"migrated:{name}", str(time.time())))
 
     def _run(self, sql, args=(), *, fetch=None):
         with self._lock:
@@ -270,6 +286,35 @@ class Store:
 
     def agents(self):
         return self._run("SELECT * FROM agents", fetch="all")
+
+    # -- housekeeping ------------------------------------------------------
+    def tasks_by_status(self, statuses):
+        marks = ",".join("?" * len(statuses))
+        return self._run(
+            f"SELECT * FROM tasks WHERE status IN ({marks}) ORDER BY created_at",
+            tuple(statuses), fetch="all",
+        ) or []
+
+    def last_event_ts(self):
+        row = self._run("SELECT MAX(ts) t FROM events", fetch="one") or {}
+        return row.get("t")
+
+    def prune(self, days):
+        """Drop events and transcripts older than `days`, keep the newest 2000
+        chat messages. Usage rows are never pruned: they are the ledger and
+        they are small. Returns rows removed per table."""
+        cutoff = time.time() - days * 86400
+        removed = {}
+        with self._lock:
+            for table in ("events", "transcript"):
+                cur = self.db.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+                removed[table] = cur.rowcount
+            cur = self.db.execute(
+                "DELETE FROM messages WHERE id NOT IN"
+                " (SELECT id FROM messages ORDER BY id DESC LIMIT 2000)")
+            removed["messages"] = cur.rowcount
+            self.db.commit()
+        return removed
 
     # -- tasks -------------------------------------------------------------
     def create_task(self, title, brief, assignee, created_by):

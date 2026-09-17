@@ -331,6 +331,35 @@ approval round trip:
 .venv/bin/python -m tests.test_safety
 ```
 
+### Who this is safe for
+
+**One trusted operator, on a machine they own.** The office holds real
+credentials and runs shell commands. What the hardening buys you:
+
+- **Agents cannot see the office's secrets.** At startup the daemon copies its
+  own credentials (`SLACK_TOKEN`, `MAIL_PASSWORD`, `OFFICE_TOKEN`, …) into a
+  private registry and strips everything unrecognised from its environment, so
+  an agent shell that runs `env` sees `PATH`, `HOME`, the SDK's own credential,
+  and the non-secret tool config you list in `OFFICE_ENV_PASSTHROUGH`. The names
+  dropped are logged at boot; the values never are.
+- **`env`, `printenv` and `ps` are not auto-approved.** They are read-only, and
+  they are the three fastest credential dumps there are.
+- **Read-only commands pointed at secrets ask first.** `cat` runs without a
+  click; `cat ~/.ssh/id_ed25519`, `cat .env`, `head /proc/self/environ` raise an
+  approval card marked *names a secret path*. The list is `SHELL_DENY_PATHS`.
+- **The SDK never reads your `~/.claude`.** With the credential in the
+  environment, the daemon points the SDK at `data/claude/` instead, so a personal
+  `settings.json` allow-rule cannot approve a command before the office's gate
+  sees it, and personal plugins never enter an agent's context.
+
+What it does **not** buy you: the credential the agent itself runs on
+(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) must reach the SDK's process,
+so an *approved* shell command can read it. That is the residual risk of an LLM
+with Bash, and it is why Bash auto-approves nothing but the read-only list.
+Making this safe to hand to other people means running each worker in its own
+container with only the mounts and credentials that role needs — a separate
+project, deliberately not started.
+
 ## Hosting on a VPS
 
 Intended shape: bind loopback, let nginx or Caddy terminate TLS.
@@ -406,3 +435,10 @@ deploy/          systemd unit, nginx config, env template
 | `OFFICE_PATROL_MIN` / `_MAX` | `150` / `320` | seconds between manager patrols |
 | `OFFICE_SOCIAL_TICK` | `12` | how often the social ticker looks around |
 | `OFFICE_MOCK_FAILURE_RATE` | `0.18` | mock-only: share of tasks that fail |
+| `OFFICE_TZ` | system | IANA zone for `now`, reminders, routines. Set it on a VPS |
+| `OFFICE_MAX_CONCURRENT` | `3` | model calls allowed at once; keep low on a subscription |
+| `OFFICE_SESSION_TOKEN_BUDGET` | `0` | tokens per window before the office pauses; **the** ceiling on a subscription |
+| `OFFICE_SESSION_WINDOW` | `18000` | that window, seconds (5h = a Claude plan's) |
+| `OFFICE_RETENTION_DAYS` | `30` | events and transcripts older than this are pruned nightly |
+| `OFFICE_ENV_PASSTHROUGH` | — | extra non-secret variables the agent shell may see |
+| `OFFICE_ISOLATE_CLAUDE_CONFIG` | `1` | point the SDK at `data/claude/`, not `~/.claude` (needs the credential in env) |

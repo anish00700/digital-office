@@ -24,6 +24,8 @@ import imaplib
 import os
 import time
 
+from .. import config
+
 
 def _decode(raw):
     if not raw:
@@ -53,15 +55,15 @@ def _body_excerpt(msg, limit=300):
 
 
 async def fetch(since_hours=12):
-    host = os.environ.get("MAIL_HOST")
-    user = os.environ.get("MAIL_USER")
-    password = os.environ.get("MAIL_PASSWORD")
+    host = config.secret("MAIL_HOST")
+    user = config.secret("MAIL_USER")
+    password = config.secret("MAIL_PASSWORD")
     if not (host and user and password):
         return ("Email is not configured. Set MAIL_HOST, MAIL_USER and "
                 "MAIL_PASSWORD to enable this desk. Report this to your "
                 "principal rather than guessing at content.")
 
-    folder = os.environ.get("MAIL_FOLDER", "INBOX")
+    folder = config.secret("MAIL_FOLDER", "INBOX")
     since = time.strftime("%d-%b-%Y", time.localtime(time.time() - since_hours * 3600))
 
     try:

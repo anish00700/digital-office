@@ -58,6 +58,27 @@ def seeded(store):
 
 # ---------------------------------------------------------------- roster --
 
+def test_legacy_office_gets_its_staff_back(store):
+    """A database from before staff packs has the original eight in `agents`
+    and nothing in `roster`. It used to land on the first-run screen with
+    everyone gone; it comes back as the infrastructure team instead."""
+    store.ensure_agents(["manager", "sre", "pipeline", "comms", "researcher",
+                         "scheduler", "writer", "analyst"])
+    roster.load(store)
+    assert not roster.setup_needed(store)
+    assert store.setting("pack") == "devops"
+    ids = {r["id"] for r in store.roster_rows()}
+    assert {"manager", "hr", "sre", "pipeline", "comms", "researcher",
+            "scheduler", "writer", "analyst"} <= ids
+
+
+def test_fresh_office_still_asks(store):
+    """No legacy rows -> first-run screen, exactly as before."""
+    roster.load(store)
+    assert roster.setup_needed(store)
+    assert {r["id"] for r in store.roster_rows()} == {"manager", "hr"}
+
+
 def test_seeding_installs_core_then_pack(store):
     roster.load(store)
     # Before a pack is chosen, only the machinery exists.
