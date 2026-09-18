@@ -8,3 +8,5 @@ __pycache__/
 
 # Personal Claude Code config - machine-specific, keep it local
 .claude/settings.local.json
+.DS_Store
+.claude/launch.json
