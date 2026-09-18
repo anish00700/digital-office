@@ -422,3 +422,51 @@ def test_shipped_devops_office_matches_the_role_definitions():
         assert tuple(entry.get("skills", ())) == role.skills, sid
         assert entry["model"] == role.model and entry["effort"] == role.effort, sid
         assert entry["max_turns"] == role.max_turns, sid
+
+
+# ------------------------------------------------------------ staff packs --
+
+@pytest.mark.parametrize("pack_id", sorted(config.PACKS))
+def test_every_pack_seats_a_valid_office(store, pack_id):
+    """A pack is shipped product: every role in it has to be seatable, hold
+    only tools that exist, and carry a persona worth paying for."""
+    from office import tools as tools_mod
+    roster.load(store)
+    roster.install_pack(store, pack_id, "a test principal")
+    seated = roster.snapshot()
+    assert {r.id for r in seated} == set(config.CORE_IDS) | set(config.PACKS[pack_id]["staff"])
+    desks = [tuple(r.desk) for r in seated]
+    assert len(desks) == len(set(desks)), "two people share a desk"
+    for r in seated:
+        if r.id != config.MANAGER_ID:
+            assert tuple(r.desk) in config.DESK_SLOTS, r.id
+        assert set(r.office_tools) <= tools_mod.tool_names(), r.id
+        assert set(r.native_tools) <= set(config.NATIVE_TOOL_CHOICES), r.id
+        assert r.model in config.MODEL_CHOICES and r.effort in config.EFFORT_CHOICES, r.id
+        assert len(r.persona) > 200, r.id
+
+
+def test_role_ids_names_and_desks_are_unique():
+    roles = list(config.ROLE_DEFS.values())
+    for field in ("id", "name"):
+        values = [getattr(r, field) for r in roles]
+        assert len(values) == len(set(values)), field
+
+
+def test_the_web_studio_covers_the_stack_it_claims():
+    """The pack exists to build web products; if a technology has no owner,
+    Miles has nobody to delegate that part of the job to."""
+    staff = {rid: config.ROLE_DEFS[rid] for rid in config.PACKS["web"]["staff"]}
+    persona = {rid: r.persona.lower() for rid, r in staff.items()}
+    for tech, owner in (("next.js", "fullstack"), ("react", "frontend"),
+                        ("nestjs", "backend"), ("wcag", "visual"),
+                        ("accessibility", "qa")):
+        assert tech in persona[owner], f"{tech} has no owner"
+    # Engineers run commands; designers hand over specifications instead.
+    for rid in ("frontend", "fullstack", "backend", "qa"):
+        assert "Bash" in staff[rid].native_tools, rid
+    for rid in ("ux", "visual"):
+        assert "Bash" not in staff[rid].native_tools, rid
+        assert "Write" in staff[rid].native_tools, rid
+    for rid, r in staff.items():
+        assert {"finish", "ask_colleague"} <= set(r.office_tools), rid

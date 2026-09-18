@@ -65,6 +65,7 @@ and which staff to start with:
 | **Infrastructure team** | SRE, CI/CD, comms, research, scheduling, writing, analysis. |
 | **Solo studio** | Inbox, calendar, drafts and numbers, without the infra roles. |
 | **Research desk** | Researcher, red team, analyst, writer, scheduling. |
+| **Web studio** | Next.js lead, React engineer, NestJS engineer, product designer, design systems, QA and accessibility, copy. |
 
 None of it is permanent: every pack is just a starting roster you can fire,
 rewrite and add to. Miles and Wren are in all of them, because one delegates
@@ -80,6 +81,28 @@ OFFICE_PRINCIPAL="a machine learning researcher at a small lab"
 
 Desks are assigned from the floor plan at seed time rather than hardcoded per
 role, so any combination of staff seats itself without collisions.
+
+### Running two offices at once
+
+One checkout, one credential, two offices that share nothing else — separate
+databases, separate workspaces, separate spend ledgers. The second office keeps
+its settings in its own file, named by `OFFICE_ENV`:
+
+```bash
+OFFICE_ENV=.env.web ./officectl start
+```
+
+`.env` is still read, after the named file, so shared values (your
+`CLAUDE_CODE_OAUTH_TOKEN`) live in one place and nothing secret is copied
+between offices. Every other command takes the same prefix:
+`OFFICE_ENV=.env.web ./officectl stop|status|logs`. A copyable starting point is
+in `deploy/web-office.env.example`; what matters is that the second office sets
+its own `OFFICE_PORT`, `OFFICE_DATA_DIR` and `OFFICE_WORKSPACE`.
+
+Because the ledger is per database, the usage modal in each office shows what
+*that* office cost and nothing else — which is how you price one project. Both
+offices draw on the same subscription window, though, so keep the sum of their
+`OFFICE_MAX_CONCURRENT` at or below what one office would have used.
 
 ### Saving and moving an office
 

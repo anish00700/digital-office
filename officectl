@@ -10,6 +10,11 @@
 #   ./officectl export [name]   save this office to ~/.digital-office
 #   ./officectl import <name>   restore one, yours or a shipped template
 #   ./officectl offices         list what you can import
+#
+# A second office on the same checkout keeps its settings in its own file:
+#   OFFICE_ENV=.env.web ./officectl start
+# Shared values (your credential) stay in .env; the named file wins where the
+# two disagree, and every command - stop, status, logs - needs the same prefix.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,7 +27,7 @@ PY="$VENV/bin/python"
 # fresh terminal silently starts an office with no credentials.
 # Parsed rather than sourced: a config file should not be able to run commands.
 load_env() {
-  [ -f .env ] || return 0
+  [ -f "$1" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     case "$line" in *=*) ;; *) continue ;; esac
@@ -47,9 +52,18 @@ load_env() {
       esac
       export "$key=$value"
     fi
-  done < .env
+  done < "$1"
 }
-load_env
+# The named office first: load_env only sets what is still unset, so whichever
+# file is read first wins, and .env stays the place for what they share.
+if [ -n "${OFFICE_ENV:-}" ]; then
+  if [ ! -f "$OFFICE_ENV" ]; then
+    echo "OFFICE_ENV=$OFFICE_ENV does not exist" >&2
+    exit 1
+  fi
+  load_env "$OFFICE_ENV"
+fi
+load_env .env
 
 # Derived AFTER load_env, because the daemon writes its pid and log under
 # OFFICE_DATA_DIR. Hardcoding data/ here meant `stop` looked in the wrong place
