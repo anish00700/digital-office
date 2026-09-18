@@ -108,7 +108,17 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/routines":
             return self._json({"routines": self._routines(), "help": routines_mod.HELP})
         if route == "/api/safety":
-            return self._json(self.office.safety())
+            return self._json({**self.office.safety(),
+                               "always_ask": list(config.SHELL_ALWAYS_ASK),
+                               "sensitive_paths": list(config.SENSITIVE_PATHS),
+                               "egress_allow": list(config.EGRESS_ALLOW),
+                               "profile": config.PROFILE, "sandbox": config.SANDBOX})
+        if route == "/api/audit":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            limit = min(1000, max(1, int(qs.get("limit", ["200"])[0])))
+            return self._json({"audit": self.office.store.audit_rows(limit),
+                               "counts": self.office.store.audit_counts(
+                                   time.time() - 7 * 86400)})
         if route == "/api/tasks":
             return self._json({"tasks": self.office.store.tasks()})
         if route == "/api/setup":
@@ -159,6 +169,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/resume":
             self.office.resume()
+            return self._json({"ok": True})
+
+        if route == "/api/lockdown":
+            reason = (body.get("reason") or "locked down by you").strip()[:120]
+            self.office.lockdown(reason)
+            return self._json({"ok": True, "locked": reason})
+
+        if route == "/api/unlock":
+            self.office.unlock()
             return self._json({"ok": True})
 
         if route == "/api/task/cancel":
@@ -338,6 +357,9 @@ class Handler(BaseHTTPRequestHandler):
             "auth": self.office.backend.describe_auth(),
             "paused": self.office._paused_reason or None,
             "paused_until": self.office._paused_until or None,
+            "locked": self.office.locked_reason or None,
+            "profile": config.PROFILE,
+            "sandbox": config.SANDBOX,
             "front_desk": bool(config.ROUTER and hasattr(self.office.backend, "structured")),
             "careful_mode": self.office.careful_mode(),
             "reviewer": config.REVIEWER_ID if config.REVIEWER_ID in config.STAFF_IDS else None,

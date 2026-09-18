@@ -28,9 +28,18 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from . import config
+from . import config, redact
 
 log = logging.getLogger("office.llm")
+
+
+def clean_result(ctx, tool_name, out):
+    """Every office-tool result passes here before the model sees it: clipped,
+    then scanned. A hit is audited by kind only, never by value."""
+    text, hits = redact.redact(truncate(out))
+    if hits:
+        ctx.audit("redaction", f"{tool_name}: {redact.summarise(hits)}", "redacted")
+    return text
 
 
 @dataclass
@@ -194,7 +203,7 @@ class AgentSDKBackend:
                     "content": [{"type": "text", "text": f"tool error: {exc}"}],
                     "is_error": True,
                 }
-            return {"content": [{"type": "text", "text": truncate(out)}]}
+            return {"content": [{"type": "text", "text": clean_result(ctx, spec.name, out)}]}
 
         handler.__name__ = f"office_{spec.name}"
         annotations = None
@@ -215,13 +224,34 @@ class AgentSDKBackend:
         sdk = self._sdk
         server = self._build_server(req.tools, ctx)
 
+        # Only the office's own tools are pre-approved. Every native tool -
+        # including read-only ones - goes through can_use_tool, where the
+        # gate auto-allows an ordinary read and asks about a sensitive path.
         allowed = [f"mcp__office__{s.name}" for s in req.tools]
-        # Read-only natives are pre-approved; anything that can touch the
-        # machine or the network with side effects falls through to
-        # can_use_tool and becomes an approval request in the GUI.
-        for nt in req.native_tools:
-            if nt in ("Read", "Grep", "Glob", "WebSearch", "WebFetch"):
-                allowed.append(nt)
+
+        # Built-in tool results (Bash, Read, Grep...) never pass through this
+        # process, except here: a PostToolUse hook that rewrites the output
+        # before the model sees it. Shape is preserved, so the CLI accepts it.
+        hooks = None
+        matcher = getattr(sdk, "HookMatcher", None)
+        if matcher is not None and hasattr(ctx, "post_tool_hook"):
+            hooks = {"PostToolUse": [matcher(matcher=None, hooks=[ctx.post_tool_hook])]}
+
+        # Sandbox: the CLI runs in a container that holds only this role's
+        # needs. The wrapper reads its hints from these variables; options.env
+        # merges over the daemon's (already scrubbed) environment.
+        sandbox = {}
+        if config.SANDBOX == "docker":
+            writes = bool({"Write", "Edit", "NotebookEdit", "MultiEdit"} & set(req.native_tools))
+            fetches = bool({"WebFetch", "WebSearch"} & set(req.native_tools))
+            sandbox = {
+                "cli_path": str(config.SANDBOX_WRAPPER),
+                "env": {"OFFICE_ROLE": req.agent_id,
+                        "OFFICE_SANDBOX_RW": "1" if writes else "0",
+                        "OFFICE_SANDBOX_NET": "bridge" if fetches else "none",
+                        "OFFICE_SANDBOX_IMAGE": config.SANDBOX_IMAGE,
+                        "OFFICE_WORKSPACE": str(config.WORKSPACE)},
+            }
 
         # No env= here on purpose. The SDK merges options.env OVER os.environ
         # (subprocess_cli.py: {**inherited_env, **options.env}), so passing a
@@ -260,6 +290,8 @@ class AgentSDKBackend:
             cwd=req.cwd or str(config.WORKSPACE),
             include_partial_messages=False,
             stderr=lambda line: ctx.log_stderr(line),
+            **({"hooks": hooks} if hooks else {}),
+            **sandbox,
         )
 
         turn = Turn()
@@ -541,7 +573,7 @@ class APIBackend:
                 try:
                     out = ctx.run_coroutine(spec.handler(call.input, ctx))
                     results.append({"type": "tool_result", "tool_use_id": call.id,
-                                    "content": truncate(out)})
+                                    "content": clean_result(ctx, call.name, out)})
                 except Exception as exc:
                     results.append({"type": "tool_result", "tool_use_id": call.id,
                                     "content": f"tool error: {exc}", "is_error": True})
@@ -633,10 +665,10 @@ class MockBackend:
     FAILURE_RATE = 0.18
 
     def __init__(self):
-        # Read when built, not when imported: the value must follow the
-        # environment of the process that starts the office, not of whoever
-        # imported this module first.
-        self.FAILURE_RATE = float(os.environ.get("OFFICE_MOCK_FAILURE_RATE", "0.18"))
+        # From config, which read the environment at import - before the
+        # daemon scrubbed OFFICE_* out of it. Reading os.environ here saw the
+        # default every time, and the lockdown drill "failed" on an excuse.
+        self.FAILURE_RATE = config.MOCK_FAILURE_RATE
 
     EXCUSES = (
         "connection refused talking to the staging host",

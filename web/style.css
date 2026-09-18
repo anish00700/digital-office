@@ -343,6 +343,16 @@ body {
 .safetyAdd { display: flex; gap: 6px; margin-bottom: 8px; }
 .safetyAdd input { flex: 1; font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 .pill.ghostPill.careful.on { color: var(--ok); border-color: rgba(111,174,99,.5); }
+.pill.ghostPill.lock:hover { color: var(--bad); border-color: var(--bad); }
+.pill.ghostPill.lock.on { color: var(--bad); border-color: var(--bad); background: rgba(207,95,82,.12); }
+.banner.locked { background: rgba(207,95,82,.16); border-bottom-color: rgba(207,95,82,.5); color: var(--bad); }
+.auditRow { display: grid; grid-template-columns: 74px 92px 1fr auto; gap: 8px; font-size: 12px; padding: 5px 0; border-top: 1px solid var(--line); align-items: baseline; }
+.auditRow .when { color: var(--ink-dim); }
+.auditRow .kind { font-family: ui-monospace, monospace; color: var(--warn); }
+.auditRow .kind.leak, .auditRow .kind.lockdown, .auditRow .kind.exfil_attempt { color: var(--bad); }
+.auditRow .dec { color: var(--ink-dim); font-size: 11px; }
+.auditCounts { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 8px; }
+.auditCounts span { font-size: 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; color: var(--ink-dim); }
 .pill.ghostPill:disabled { opacity: .45; cursor: default; }
 .dotStatus.cancelled { background: var(--ink-dim); }
 .cardFoot { font-size: 11px; color: var(--ink-dim); margin-top: 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

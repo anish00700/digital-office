@@ -11,7 +11,7 @@ import datetime as dt
 import logging
 import time
 
-from . import config, llm, notebook, notify, roster, router, routines, tools
+from . import config, llm, notebook, notify, redact, roster, router, routines, tools
 from .bus import EventBus
 from .social import SocialLife
 from .store import Store
@@ -36,14 +36,55 @@ class AgentContext:
         self.parent_task_id = None # for a peer answer: the task that asked
         self.peer_count = 0        # colleague questions asked on this task
         self.peer_log = []         # "asked Cal: q -> a", for the result block
+        self.sensitive = False     # read under a sensitive path
 
     # -- output --------------------------------------------------------
     def emit(self, kind, **payload):
+        # The model's own words are scanned before anyone stores or shows
+        # them. A credential in what it *says* is the one leak the boundary
+        # scan on inputs cannot prevent; it is caught here, and it locks the
+        # office if it is a real one.
+        text = payload.get("text")
+        if text and kind in ("say", "thinking", "error", "message_user"):
+            text = self.office.scrub(text, self, f"{kind} by {self.agent_id}")
+            payload["text"] = text
         self.office.bus.publish(f"agent.{kind}", agent_id=self.agent_id,
                                 task_id=self.task_id, **payload)
-        text = payload.get("text")
         if text and kind in ("say", "thinking", "error"):
             self.store.add_transcript(self.agent_id, kind, text, self.task_id)
+
+    def audit(self, kind, detail, decision="noted"):
+        self.store.audit(kind, detail, decision, self.agent_id, self.task_id)
+
+    def mark_sensitive(self, what=""):
+        """This task read under a sensitive path. Its result stays out of the
+        shared notebook, the lessons and every notification."""
+        if not self.sensitive:
+            self.sensitive = True
+            if self.task_id:
+                self.store.update_task(self.task_id, sensitive=1)
+            self.audit("sensitive_task", what or "marked sensitive", "noted")
+
+    async def post_tool_hook(self, hook_input, tool_use_id, _context):
+        """Claude Code's PostToolUse hook: the only place a built-in tool's
+        result (Bash, Read, Grep, WebFetch) passes through this process
+        before the model reads it. Rewrites it, shape intact, if it holds a
+        secret; records the kind, never the value."""
+        try:
+            response = hook_input.get("tool_response")
+            cleaned, hits = redact.redact_obj(response)
+            if not hits:
+                return {}
+            tool = hook_input.get("tool_name", "tool")
+            self.audit("redaction", f"{tool}: {redact.summarise(hits)}", "redacted")
+            if config.PRODUCTION and redact.is_high(hits):
+                self.office.lockdown(
+                    f"a {tool} result for {config.role(self.agent_id).name} held a credential")
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                           "updatedToolOutput": cleaned}}
+        except Exception:
+            log.exception("post-tool hook failed; output passed through unchanged")
+            return {}
 
     def log_stderr(self, line):
         if line and line.strip():
@@ -83,6 +124,9 @@ class Office:
         self._current = {}           # agent_id -> the asyncio.Task running its job
         self._cancelled = set()      # task ids cancelled while queued or running
         self._last_message = ("", 0.0)
+        self.locked = False
+        self.locked_reason = ""
+        self.locked_at = 0.0
         # One gate for every model call; see config.MAX_CONCURRENT.
         self._model_slots = asyncio.Semaphore(config.MAX_CONCURRENT)
         self._last_prune = 0.0
@@ -164,6 +208,9 @@ class Office:
             "paused_until": self._paused_until or None,
             "front_desk": bool(config.ROUTER and hasattr(self.backend, "structured")),
             "careful_mode": self.careful_mode(),
+            "locked": self.locked_reason or None,
+            "profile": config.PROFILE,
+            "sandbox": config.SANDBOX,
             "reviewer": config.REVIEWER_ID if config.REVIEWER_ID in config.STAFF_IDS else None,
             "notifications": bool(config.NOTIFY_URL),
             "routines": len([r for r in self.store.routines() if r["enabled"]]),
@@ -191,6 +238,54 @@ class Office:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
+    # -- secrets in output, lockdown ---------------------------------------------
+    def scrub(self, text, ctx=None, where="output"):
+        """Redact model output before it is stored or shown. A high-severity
+        hit - a real credential shape, or one of the office's own secrets -
+        locks the office; a low one only redacts and logs."""
+        clean, hits = redact.redact(text)
+        if not hits:
+            return text
+        agent_id = ctx.agent_id if ctx is not None else None
+        task_id = ctx.task_id if ctx is not None else None
+        self.store.audit("leak", f"{where}: {redact.summarise(hits)}", "redacted",
+                         agent_id, task_id)
+        if config.LOCKDOWN_ON_LEAK and redact.is_high(hits):
+            who = config.role(agent_id).name if agent_id in config.STAFF_IDS \
+                or agent_id == config.MANAGER_ID else (agent_id or "the office")
+            self.lockdown(f"a credential appeared in {who}'s output ({redact.summarise(hits)})")
+        return clean
+
+    def lockdown(self, reason):
+        """Everything stops: no new model calls, no approvals, until you look.
+        Automatic on a secret in model output or an exfiltration attempt; a
+        button in the top bar for when you would rather be sure."""
+        def _do():
+            if self.locked:
+                return
+            self.locked, self.locked_reason, self.locked_at = True, reason, time.time()
+            self.store.audit("lockdown", reason, "locked")
+            log.warning("LOCKDOWN: %s", reason)
+            self.bus.publish("office.locked", reason=reason)
+            # Anyone waiting on an approval gets a no, now, with the reason.
+            for approval_id, waiter in list(self._approval_waiters.items()):
+                self.store.decide_approval(approval_id, "denied", "office locked down")
+                self.bus.publish("approval.decided", id=approval_id, status="denied")
+                waiter.set_result_safe((False, ""))
+            self._approval_waiters.clear()
+        self._on_loop(_do)
+        self.pause(f"locked down: {reason}")
+
+    def unlock(self):
+        def _do():
+            if not self.locked:
+                return
+            self.locked, self.locked_reason, self.locked_at = False, "", 0.0
+            self.store.audit("lockdown", "unlocked by principal", "unlocked")
+            self.bus.publish("office.unlocked")
+        self._on_loop(_do)
+        self.resume()
+
     # -- feedback, retry, review ---------------------------------------------
     def set_feedback(self, task_id, up, note=""):
         """Your verdict on a finished task. A note becomes a lesson for the
@@ -204,7 +299,7 @@ class Office:
         learned = False
         if note:
             lesson = note if up else f"Feedback on '{row['title'][:50]}': {note}"
-            learned = bool(self.store.add_lesson(row["assignee"], lesson))
+            learned = bool(self.store.add_lesson(row["assignee"], redact.redact(lesson)[0]))
         self.bus.publish("task.feedback", agent_id=row["assignee"], task_id=task_id,
                          feedback=verdict, note=note, learned=learned)
         return {"feedback": verdict, "learned": learned}
@@ -445,6 +540,8 @@ class Office:
 
     def resume(self):
         def _do():
+            if self.locked:
+                return                      # unlock() is the only way out
             if not self._paused_reason:
                 return
             log.info("resumed")
@@ -791,7 +888,10 @@ class Office:
     # -- human in the loop ----------------------------------------------
     async def request_approval(self, ctx, kind, action, detail=""):
         """Returns a Verdict: truthy when approved, and readable as
-        "declined" or "expired" when not."""
+        "declined" or "expired" when not. A locked office approves nothing."""
+        if self.locked:
+            ctx.audit("blocked", f"{kind} approval while locked down", "denied")
+            return Verdict("declined")
         verdict, _ = await self._await_human(ctx, kind, action, detail)
         return verdict
 
@@ -922,7 +1022,8 @@ class Office:
         request = llm.RunRequest(
             agent_id=role.id,
             system=(config.fill(role.persona, self.principal())
-                    + notebook.lesson_block(self.store, role.id)),
+                    + notebook.lesson_block(self.store, role.id)
+                    + config.SAFETY_RULES),
             prompt=task["brief"],
             tools=tools.specs_for(role, peer=peer),
             native_tools=(tuple(t for t in role.native_tools
@@ -954,7 +1055,7 @@ class Office:
             self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
                              status="running")
 
-        result = ctx.result or turn.text or "(no output)"
+        result = self.scrub(ctx.result or turn.text or "(no output)", ctx, "result")
         if ctx.peer_log:
             # Miles reads results, not transcripts: who was consulted, and
             # what they said, has to be in the result to be seen at all.
@@ -978,8 +1079,9 @@ class Office:
             status = "done"
         # The office records what happened itself. Paying an agent to summarise
         # what the database already knows would be an absurd way to spend a turn.
+        # A sensitive task leaves no line: the shared notebook is read by everyone.
         with contextlib.suppress(Exception):
-            notebook.log_activity(
+            ctx.sensitive or notebook.log_activity(
                 self.store,
                 f"**{role.name}** {status} — {ctx.task_title}"
                 + (f" ({turn.error.splitlines()[0][:70]})" if turn.error else
@@ -988,8 +1090,10 @@ class Office:
                                error=error or None, stop=turn.stop or None,
                                finished_at=time.time())
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
-                         status=status, stop=turn.stop, result=result[:400],
-                         title=task["title"], routine=(ctx.origin == "routine"))
+                         status=status, stop=turn.stop,
+                         result="" if ctx.sensitive else result[:400],
+                         title=task["title"], routine=(ctx.origin == "routine"),
+                         sensitive=ctx.sensitive)
         if status == "failed":
             self._on_failure(role.id, task_id, turn.error)
 
@@ -1022,7 +1126,8 @@ class Office:
         request = llm.RunRequest(
             agent_id=role.id,
             system=(config.fill(role.persona, self.principal())
-                    + notebook.lesson_block(self.store, role.id)),
+                    + notebook.lesson_block(self.store, role.id)
+                    + config.SAFETY_RULES),
             prompt=self._memory_block(text) + text,
             tools=tools.specs_for(role),
             native_tools=role.native_tools,
@@ -1047,7 +1152,7 @@ class Office:
         # reply is never silently swallowed - and a reply cut short says so,
         # rather than reading as a complete answer that happens to end oddly.
         if not ctx.result:
-            text = turn.error or turn.text or ""
+            text = self.scrub(turn.error or turn.text or "", ctx, "manager reply")
             if turn.stop in llm.PARTIAL_STOPS and not turn.error:
                 why = {"max_turns": "turns", "budget_exhausted": "budget",
                        "max_tokens": "room to reply"}.get(turn.stop, turn.stop)
@@ -1098,6 +1203,7 @@ class Office:
         return first + 86400
 
     def _say_to_user(self, text):
+        text = self.scrub(text, None, "message to principal")
         self.store.add_message(config.MANAGER_ID, "user", text)
         self.bus.publish("agent.message_user", agent_id=config.MANAGER_ID, text=text)
 

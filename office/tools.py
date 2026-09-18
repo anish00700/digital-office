@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from . import config, routines as routines_mod
+from . import config, redact, routines as routines_mod
 from .connectors import mail as mail_connector
 from .connectors import slack as slack_connector
 from .llm import truncate
@@ -225,6 +225,7 @@ async def _message_user(args, ctx):
     text = (args.get("text") or "").strip()
     if not text:
         return "empty message not sent"
+    text = ctx.office.scrub(text, ctx, "message_user")
     if ctx.agent_id == config.MANAGER_ID:
         # Careful mode: the reply goes past the red team first. One extra
         # turn, only when you asked for it, only when a reviewer is on staff.
@@ -616,40 +617,128 @@ def _deny_message(verdict, what):
     return f"Your principal declined this {what}."
 
 
-async def permission_gate(ctx, tool_name, input_data, _context):
-    """Routed here by the Agent SDK whenever a call is not pre-approved.
+def _first_words(command, n=2):
+    words = " ".join((command or "").split()).split()
+    return " ".join(w.rsplit("/", 1)[-1] if i == 0 else w for i, w in enumerate(words[:n]))
 
-    Read-only shell commands pass. Writes inside the workspace pass. Everything
-    else becomes an approval card in the GUI and waits for a human.
+
+def always_asks(command):
+    """Binaries that move bytes off the machine never run without asking,
+    whatever the allowlist says and whoever added to it."""
+    cmd = " ".join((command or "").split())
+    if not cmd:
+        return False
+    one, two = _first_words(cmd, 1), _first_words(cmd, 2)
+    return any(cmd == p or one == p or two == p or cmd.startswith(p + " ")
+               for p in config.SHELL_ALWAYS_ASK)
+
+
+def _host_of(url):
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _egress_allowed(host):
+    if not config.EGRESS_ALLOW:
+        return True
+    return any(host == h or host.endswith("." + h) for h in config.EGRESS_ALLOW)
+
+
+async def permission_gate(ctx, tool_name, input_data, _context):
+    """Routed here by the Agent SDK for every tool call that is not one of
+    the office's own. Nothing native is pre-approved any more: reads are
+    auto-allowed *here*, after the path is checked, so a read-only tool
+    pointed at a secret asks like anything else.
+
+    Order of the checks is the order of the threat: locked office first, a
+    secret leaving through the call itself second, then the path or host,
+    then the ordinary allowlist.
     """
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
+    office = ctx.office
+    if office.locked:
+        ctx.audit("blocked", f"{tool_name} while locked down", "denied")
+        return PermissionResultDeny(
+            message="The office is locked down. Nothing runs and nothing can be "
+                    "approved until your principal unlocks it. Stop and report.")
+
+    def allow():
+        return PermissionResultAllow(updated_input=input_data)
+
+    async def ask(kind, action, what, detail=""):
+        ok = await ctx.request_approval(kind, action, detail=detail or ctx.task_title)
+        if ok:
+            return allow()
+        return PermissionResultDeny(message=_deny_message(ok, what))
+
+    # -- a secret in the call itself is exfiltration, whatever the tool ------
+    outbound = ""
+    if tool_name == "Bash":
+        outbound = input_data.get("command", "")
+    elif tool_name in ("WebFetch", "WebSearch"):
+        outbound = str(input_data.get("url") or input_data.get("query") or "")
+    if outbound and redact.contains_secret(outbound):
+        ctx.audit("exfil_attempt", f"{tool_name} carried a secret-shaped value", "denied")
+        office.lockdown(f"{config.role(ctx.agent_id).name} tried to send a secret "
+                        f"through {tool_name}")
+        return PermissionResultDeny(
+            message="Refused: that call carries something that looks like a credential. "
+                    "Never put a secret in a command, a URL or a query. The office has "
+                    "been locked for review; stop and report what you were doing.")
+
     if tool_name == "Bash":
         command = input_data.get("command", "")
+        if always_asks(command):
+            ctx.audit("shell_network", _first_words(command, 2), "asked")
+            return await ask("shell", command, "command",
+                             f"⚠ moves data off this machine · {ctx.task_title}")
         if _is_auto_allowed_shell(command):
             ctx.emit("tool", tool="bash", args=command[:160])
-            return PermissionResultAllow(updated_input=input_data)
+            return allow()
         detail = ctx.task_title
         if config.names_secret_path(command):
             detail = f"⚠ names a secret path · {ctx.task_title}"
-        ok = await ctx.request_approval("shell", command, detail=detail)
-        if ok:
-            return PermissionResultAllow(updated_input=input_data)
-        return PermissionResultDeny(message=_deny_message(ok, "command"))
+            ctx.audit("secret_path", _first_words(command, 3), "asked")
+        return await ask("shell", command, "command", detail)
 
-    if tool_name in ("Write", "Edit", "NotebookEdit"):
+    if tool_name in ("Read", "Grep", "Glob", "LS"):
+        path = str(input_data.get("file_path") or input_data.get("path") or "")
+        target = path or str(input_data.get("pattern") or "")
+        if path and (config.is_sensitive_path(path) or config.names_secret_path(path)):
+            ctx.audit("sensitive_read", f"{tool_name} {path[-120:]}", "asked")
+            verdict = await ctx.request_approval(
+                "read", f"{tool_name} {path}", detail=f"⚠ sensitive path · {ctx.task_title}")
+            if verdict:
+                ctx.mark_sensitive(path)
+                return allow()
+            return PermissionResultDeny(message=_deny_message(verdict, "read of a sensitive path"))
+        ctx.emit("tool", tool=tool_name.lower(), args=target[-80:])
+        return allow()
+
+    if tool_name in ("WebFetch", "WebSearch"):
+        url = str(input_data.get("url") or "")
+        host = _host_of(url) if url else "search"
+        if url and not _egress_allowed(host):
+            ctx.audit("egress", f"{tool_name} {host}", "asked")
+            return await ask("egress", f"{tool_name} {url[:200]}", "request to that host",
+                             f"⚠ host not on the allowlist · {ctx.task_title}")
+        ctx.audit("egress", f"{tool_name} {host}", "allowed")
+        ctx.emit("tool", tool=tool_name.lower(), args=(url or str(input_data.get("query", "")))[:120])
+        return allow()
+
+    if tool_name in ("Write", "Edit", "NotebookEdit", "MultiEdit"):
         path = input_data.get("file_path") or input_data.get("path") or ""
-        if _within_workspace(path):
+        if config.is_sensitive_path(path) or config.names_secret_path(str(path)):
+            ctx.audit("sensitive_write", f"{tool_name} {str(path)[-120:]}", "asked")
+            return await ask("write", f"{tool_name} {path}", "write to a sensitive path",
+                             f"⚠ sensitive path · {ctx.task_title}")
+        if _within_workspace(path) and not config.WRITES_ALWAYS_ASK:
             ctx.emit("tool", tool=tool_name.lower(), args=str(path)[-80:])
-            return PermissionResultAllow(updated_input=input_data)
-        ok = await ctx.request_approval("write", f"{tool_name} {path}",
-                                        detail=ctx.task_title)
-        if ok:
-            return PermissionResultAllow(updated_input=input_data)
-        return PermissionResultDeny(message=_deny_message(ok, "write outside the workspace"))
+            return allow()
+        return await ask("write", f"{tool_name} {path}", "write")
 
-    ok = await ctx.request_approval("tool", f"{tool_name} {str(input_data)[:200]}",
-                                    detail=ctx.task_title)
-    if ok:
-        return PermissionResultAllow(updated_input=input_data)
-    return PermissionResultDeny(message=_deny_message(ok, "tool call"))
+    return await ask("tool", f"{tool_name} {str(input_data)[:200]}", "tool call")

@@ -25,6 +25,7 @@
   <button id="approvalsBtn" class="pill hidden">⚠ <span id="approvalsCount">0</span> waiting on you</button>
   <button id="carefulBtn" class="pill ghostPill" title="Route replies past the red team before they reach you">🛡 Careful</button>
   <button id="pauseBtn" class="pill ghostPill" title="Stop starting new model calls; running work finishes">⏸ Pause</button>
+  <button id="lockBtn" class="pill ghostPill lock" title="Lock down: nothing runs and nothing can be approved until you unlock">🔒 Lock down</button>
 </header>
 <div id="pausedBanner" class="banner hidden">
   <span id="pausedText">Paused</span>
@@ -152,6 +153,11 @@
       schedule. The result is posted to chat. Nothing runs unless you set it up.</p>
     <div id="routinesList"></div>
     <div id="routineAdd"></div>
+    <h3 class="sSection">Audit</h3>
+    <p class="muted staffNote">Every sensitive read, every request to leave the machine,
+      every redaction and every lockdown, newest first. Kinds only - a value that was
+      redacted is not in this log either.</p>
+    <div id="auditBox"></div>
     <h3 class="sSection">Safety</h3>
     <p class="muted staffNote">Shell commands that run without asking. Anything you
       add here is trusted on every task; a deny beats every allow, including the

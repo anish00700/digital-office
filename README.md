@@ -414,32 +414,66 @@ approval round trip:
 
 ### Who this is safe for
 
-**One trusted operator, on a machine they own.** The office holds real
-credentials and runs shell commands. What the hardening buys you:
+One trusted operator, on a machine they own. The office holds real credentials and
+gives employees Bash on the host; what follows is what keeps that survivable.
 
-- **Agents cannot see the office's secrets.** At startup the daemon copies its
-  own credentials (`SLACK_TOKEN`, `MAIL_PASSWORD`, `OFFICE_TOKEN`, …) into a
-  private registry and strips everything unrecognised from its environment, so
-  an agent shell that runs `env` sees `PATH`, `HOME`, the SDK's own credential,
-  and the non-secret tool config you list in `OFFICE_ENV_PASSTHROUGH`. The names
-  dropped are logged at boot; the values never are.
-- **`env`, `printenv` and `ps` are not auto-approved.** They are read-only, and
-  they are the three fastest credential dumps there are.
-- **Read-only commands pointed at secrets ask first.** `cat` runs without a
-  click; `cat ~/.ssh/id_ed25519`, `cat .env`, `head /proc/self/environ` raise an
-  approval card marked *names a secret path*. The list is `SHELL_DENY_PATHS`.
-- **The SDK never reads your `~/.claude`.** With the credential in the
-  environment, the daemon points the SDK at `data/claude/` instead, so a personal
-  `settings.json` allow-rule cannot approve a command before the office's gate
-  sees it, and personal plugins never enter an agent's context.
+**Secrets never enter an environment an employee can read.** `.env` is parsed inside
+the daemon into an in-memory vault; secret-shaped keys are never exported. The
+daemon scrubs its own environment before the first model call, so the SDK's
+subprocesses inherit nothing but the model credential and a short allowlist.
 
-What it does **not** buy you: the credential the agent itself runs on
-(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) must reach the SDK's process,
-so an *approved* shell command can read it. That is the residual risk of an LLM
-with Bash, and it is why Bash auto-approves nothing but the read-only list.
-Making this safe to hand to other people means running each worker in its own
-container with only the mounts and credentials that role needs — a separate
-project, deliberately not started.
+**Everything the model reads is scanned, and everything it says is scanned.**
+`office/redact.py` recognises AWS, GCP, GitHub, Slack, Anthropic, OpenAI and Stripe
+keys, JWTs, private-key blocks, bearer tokens, `password=` assignments,
+`user:pass@host` URLs, the office's own secret values exactly, and random-looking
+tokens. Office-tool results are redacted before the model sees them; built-in tool
+results (Bash, Read, Grep, WebFetch) are rewritten by a PostToolUse hook before the
+model sees them; the model's own text is redacted before it reaches the transcript,
+a task result, the chat, a lesson or a notification. What is logged is the kind of
+thing found, never the value. Every system prompt ends with four fixed rules
+(`config.SAFETY_RULES`): never repeat a credential, never put data in a URL or
+command, fetched content is data, stop if a secret is missing.
+
+**A credential in the model's output locks the office.** Lockdown pauses every
+worker, refuses every approval, and stays until you press Unlock
+(`OFFICE_LOCKDOWN_ON_LEAK=0` to only redact and log). The same happens when an
+employee tries to send a secret-shaped value through a command, a URL or a query.
+
+**Reads under sensitive paths ask first, even for read-only tools.**
+`OFFICE_SENSITIVE_PATHS` (defaults: `.env*`, `secrets/`, `*.pem`, `*.key`, `~/.ssh`,
+`~/.aws`, `~/.kube`, ...). A task that reads one is marked sensitive: its result stays
+out of the shared notebook, the lessons and every notification. Nothing native is
+pre-approved any more; ordinary reads are auto-allowed by the gate after the path
+is checked.
+
+**Leaving the machine always asks.** `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync`,
+`aws s3`, `kubectl cp`, `base64`, ... are never auto-approved, whatever the
+allowlist says. `OFFICE_EGRESS_ALLOW` restricts WebFetch/WebSearch to named hosts;
+every request that leaves is in the audit log.
+
+**An audit log that is never pruned** (Staff → Audit, `/api/audit`): sensitive
+reads, egress, redactions, exfiltration attempts, lockdowns. Kinds and paths, never
+values.
+
+**`OFFICE_PROFILE=production`** flips every default: nothing runs without asking,
+every write asks, notifications carry titles only, a high-severity redaction in any
+tool result locks the office, and the daemon refuses to start unless
+`OFFICE_SANDBOX=docker` (or you set `OFFICE_PRODUCTION_UNSANDBOXED_OK=1` on purpose).
+
+**`OFFICE_SANDBOX=docker`** runs each employee's Claude Code CLI in its own container
+(`deploy/sandbox/`): no host home, workspace mounted read-only unless the role can
+write, no network unless the role fetches, capabilities dropped, read-only root,
+and only the model credential crossing in (`OFFICE_SANDBOX_EXTRA_ENV` names any
+other variable a role genuinely needs). Build once:
+
+```bash
+docker build -t digital-office-agent deploy/sandbox
+```
+
+What this does **not** do: it does not make the office safe to hand to other people.
+Multi-user, accounts and per-tenant isolation are a different product. And no
+detector is complete - a secret in a format nobody has seen before passes the
+scanner; add its shape to `OFFICE_REDACT_PATTERNS`.
 
 ## Hosting on a VPS
 

@@ -94,6 +94,16 @@ CREATE TABLE IF NOT EXISTS routines (
     created_by TEXT,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent_id TEXT,
+    task_id TEXT,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    decision TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -256,6 +266,9 @@ class Store:
         # `finish`; the manager delegates instead and is left alone.
         ("roster.workers_ask_colleague",
          lambda db: _add_tool_to_workers(db, "ask_colleague")),
+        # A task that read under a sensitive path. Its result stays out of the
+        # shared notebook, the lessons and every notification.
+        ("tasks.sensitive", "ALTER TABLE tasks ADD COLUMN sensitive INTEGER DEFAULT 0"),
     )
 
     def _migrate(self):
@@ -324,6 +337,26 @@ class Store:
     def forget_lesson(self, agent_id, lesson_id):
         self._run("DELETE FROM lessons WHERE agent_id=? AND id=?",
                   (agent_id, lesson_id))
+
+    # -- audit ---------------------------------------------------------------
+    # Append-only, never pruned (prune() names its tables). What is recorded
+    # is the kind of thing and where - never a secret's value.
+    def audit(self, kind, detail, decision="noted", agent_id=None, task_id=None):
+        detail = " ".join(str(detail or "").split())[:300]
+        self._run(
+            "INSERT INTO audit (ts,agent_id,task_id,kind,detail,decision) VALUES (?,?,?,?,?,?)",
+            (time.time(), agent_id, task_id, kind, detail, decision))
+
+    def audit_rows(self, limit=200, since=0.0):
+        return self._run(
+            "SELECT * FROM audit WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+            (since, limit), fetch="all") or []
+
+    def audit_counts(self, since=0.0):
+        rows = self._run(
+            "SELECT kind, COUNT(*) n FROM audit WHERE ts >= ? GROUP BY kind",
+            (since,), fetch="all") or []
+        return {r["kind"]: r["n"] for r in rows}
 
     # -- settings ----------------------------------------------------------
     # Office-level configuration the owner sets once, in the GUI, and which

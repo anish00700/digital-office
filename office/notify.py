@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.request
 
-from . import config
+from . import config, redact
 
 log = logging.getLogger("office.notify")
 
@@ -48,8 +48,12 @@ class Notifier:
             if now - self._last.get(kind, 0) < PER_KIND_S:
                 return False
             self._last[kind] = now
-        body = " ".join((body or "").split())[:BODY_MAX]
+        # Titles only in production: a push is a copy of the office's words
+        # in a service you do not run. And never a secret, in either field.
+        body = "" if config.NOTIFY_TITLES_ONLY else " ".join((body or "").split())[:BODY_MAX]
         title = " ".join((title or "").split())[:80]
+        body, _ = redact.redact(body)
+        title, _ = redact.redact(title)
         try:
             self._post(title, body, priority)
             self.sent += 1
@@ -97,6 +101,11 @@ class Notifier:
             return self.send("paused", "Office paused", p.get("reason") or "", "low")
         if etype == "task.updated":
             status = p.get("status")
+            if p.get("sensitive"):
+                # A sensitive task's title is the most that leaves the office.
+                if status in ("needs_you", "failed"):
+                    return self.send(status, f"{who}: a sensitive task needs you", "", "high")
+                return False
             if status == "needs_you":
                 return self.send("needs_you", f"{who} needs you",
                                  p.get("title") or "a task is waiting on your decision", "high")

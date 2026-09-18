@@ -156,6 +156,9 @@ async function loadState() {
   S.frontDesk = !!state.front_desk;
   S.careful = !!state.careful_mode;
   S.reviewer = state.reviewer || '';
+  S.locked = state.locked || '';
+  S.profile = state.profile || 'default';
+  S.sandbox = state.sandbox || 'off';
   S.startedAt = state.started_at;
   S.seq = state.seq;
 
@@ -193,8 +196,12 @@ async function loadState() {
       agent_id: m.sender, ts: m.ts, payload: { text: m.body }
     }, true);
   }
-  $('backend').textContent = state.backend;
-  $('backendStat').title = 'Backend: ' + state.backend + ' - auth: ' + state.auth;
+  $('backend').textContent = state.backend
+    + (S.profile === 'production' ? ' · production' : '')
+    + (S.sandbox === 'docker' ? ' · sandboxed' : '');
+  $('backendStat').title = 'Backend: ' + state.backend + ' - auth: ' + state.auth
+    + ' - profile: ' + S.profile + ' - sandbox: ' + S.sandbox
+    + (S.sandbox !== 'docker' ? ' (employees run on this host; see deploy/sandbox)' : '');
   renderRecipients();
   renderBoard(); renderApprovals(); renderSpend(); renderFeed(); renderPaused();
   composerHint(); renderCareful();
@@ -284,6 +291,8 @@ function handle(ev) {
       S.paused = ''; S.pausedUntil = 0; renderPaused(); pushFeed(ev); break;
     case 'router.decided': pushFeed(ev); break;
     case 'office.careful': S.careful = !!p.on; renderCareful(); pushFeed(ev); break;
+    case 'office.locked': S.locked = p.reason || 'locked down'; renderPaused(); pushFeed(ev); break;
+    case 'office.unlocked': S.locked = ''; renderPaused(); pushFeed(ev); break;
     case 'task.feedback': refreshTasks(); pushFeed(ev); break;
     case 'routine.fired':
     case 'routine.changed': if (STAFF.open) loadRoutines(); pushFeed(ev); break;
@@ -2060,7 +2069,14 @@ function wireUI() {
       body: JSON.stringify(S.paused ? {} : { reason: 'paused by you' })
     });
   };
-  $('resumeBtn').onclick = () => $('pauseBtn').onclick();
+  $('resumeBtn').onclick = () => (S.locked ? $('lockBtn') : $('pauseBtn')).onclick();
+  $('lockBtn').onclick = async () => {
+    if (!S.locked && !confirm('Lock the office down? Everything stops and no approval can be given until you unlock.')) return;
+    await fetch(S.locked ? '/api/unlock' : '/api/lockdown', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(S.locked ? {} : { reason: 'locked down by you' })
+    });
+  };
   $('carefulBtn').onclick = async () => {
     await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2181,14 +2197,24 @@ async function cancelTask(id) {
 function renderPaused() {
   const banner = $('pausedBanner');
   const btn = $('pauseBtn');
+  const lock = $('lockBtn');
   if (!banner || !btn) return;
-  const on = !!S.paused;
+  const locked = !!S.locked;
+  const on = locked || !!S.paused;
   banner.classList.toggle('hidden', !on);
+  banner.classList.toggle('locked', locked);
   btn.textContent = on ? '▶ Resume' : '⏸ Pause';
   btn.classList.toggle('on', on);
+  btn.disabled = locked;
+  if (lock) {
+    lock.textContent = locked ? '🔓 Unlock' : '🔒 Lock down';
+    lock.classList.toggle('on', locked);
+  }
+  $('resumeBtn').textContent = locked ? 'Unlock' : 'Resume';
   if (on) {
-    $('pausedText').textContent = 'Paused: ' + S.paused;
-    tickPaused();
+    $('pausedText').textContent = locked ? 'LOCKED DOWN: ' + S.locked : 'Paused: ' + S.paused;
+    if (locked) $('pausedCountdown').textContent = 'nothing runs and nothing can be approved until you unlock';
+    else tickPaused();
   }
 }
 
@@ -2842,7 +2868,28 @@ async function applyRosterChange(ev) {
 async function openStaff() {
   STAFF.open = true;
   $('staffModal').classList.remove('hidden');
-  await Promise.all([loadRoster(), loadRoutines(), loadSafety()]);
+  await Promise.all([loadRoster(), loadRoutines(), loadSafety(), loadAudit()]);
+}
+
+async function loadAudit() {
+  const d = await (await fetch('/api/audit?limit=60')).json();
+  const box = $('auditBox');
+  if (!box) return;
+  box.innerHTML = '';
+  const counts = el('div', 'auditCounts');
+  for (const [k, n] of Object.entries(d.counts || {})) counts.appendChild(el('span', '', `${k} · ${n} this week`));
+  if (!Object.keys(d.counts || {}).length) counts.appendChild(el('span', '', 'nothing this week'));
+  box.appendChild(counts);
+  for (const r of d.audit || []) {
+    const row = el('div', 'auditRow');
+    row.append(
+      el('span', 'when', new Date(r.ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })),
+      el('span', 'kind ' + r.kind, r.kind),
+      el('span', '', `${(S.byId[r.agent_id] || {}).name || r.agent_id || 'office'}: ${r.detail}`),
+      el('span', 'dec', r.decision));
+    box.appendChild(row);
+  }
+  if (!(d.audit || []).length) box.appendChild(el('p', 'muted', 'No entries yet.'));
 }
 
 async function loadRoutines() {
@@ -2956,8 +3003,20 @@ function renderSafety() {
   };
   section('Added by you - runs without asking', s.allow || [], 'allow');
   section('Always ask, even if shipped as allowed', s.deny || [], 'deny');
+  const never = el('details');
+  never.innerHTML = `<summary class="rMeta">${(s.always_ask || []).length} commands that always ask (move data off this machine)</summary>`;
+  const nl = el('div', 'safetyList');
+  for (const item of s.always_ask || []) nl.appendChild(el('span', 'safetyTag deny', item));
+  never.appendChild(nl);
+  box.appendChild(never);
+  const sens = el('details');
+  sens.innerHTML = `<summary class="rMeta">${(s.sensitive_paths || []).length} sensitive path patterns (reads ask first)</summary>`;
+  const sl = el('div', 'safetyList');
+  for (const item of s.sensitive_paths || []) sl.appendChild(el('span', 'safetyTag', item));
+  sens.appendChild(sl);
+  box.appendChild(sens);
   const shipped = el('details');
-  shipped.innerHTML = `<summary class="rMeta">${(s.shipped || []).length} shipped read-only prefixes</summary>`;
+  shipped.innerHTML = `<summary class="rMeta">${(s.shipped || []).length} shipped read-only prefixes${s.profile === 'production' ? ' (off in production - everything asks)' : ''}</summary>`;
   const list = el('div', 'safetyList');
   for (const item of s.shipped || []) list.appendChild(el('span', 'safetyTag', item));
   shipped.appendChild(list);
@@ -3422,6 +3481,8 @@ function appendLine(feed, ev) {
     cls = 'error';
   }
   else if (kind === 'resumed') { who = { name: 'office', emoji: '▶' }; text = 'resumed'; cls = 'social'; }
+  else if (kind === 'locked') { who = { name: 'office', emoji: '🔒' }; text = `LOCKED DOWN: ${p.reason}`; cls = 'error'; }
+  else if (kind === 'unlocked') { who = { name: 'office', emoji: '🔓' }; text = 'unlocked'; cls = 'social'; }
   else if (kind === 'careful') { who = { name: 'office', emoji: '🛡' }; text = `careful mode ${p.on ? 'on' : 'off'}`; cls = 'social'; }
   else if (kind === 'visit') { text = `asks ${(S.byId[p.to] || {}).name || p.to}: "${p.question || ''}"`; cls = 'social'; }
   else if (kind === 'visit_end') { text = p.answered ? `back at their desk with ${(S.byId[p.to] || {}).name || p.to}'s answer` : `gave up waiting on ${(S.byId[p.to] || {}).name || p.to}`; cls = 'social'; }
