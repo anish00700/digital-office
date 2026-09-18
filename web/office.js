@@ -151,6 +151,9 @@ async function loadState() {
   S.approvals = state.approvals;
   S.spend = state.spend;
   S.backend = state.backend;
+  S.paused = state.paused || '';
+  S.pausedUntil = state.paused_until || 0;
+  S.frontDesk = !!state.front_desk;
   S.startedAt = state.started_at;
   S.seq = state.seq;
 
@@ -191,7 +194,8 @@ async function loadState() {
   $('backend').textContent = state.backend;
   $('backendStat').title = 'Backend: ' + state.backend + ' - auth: ' + state.auth;
   renderRecipients();
-  renderBoard(); renderApprovals(); renderSpend(); renderFeed();
+  renderBoard(); renderApprovals(); renderSpend(); renderFeed(); renderPaused();
+  composerHint();
   S.principal = state.principal || '';
   if (state.setup_needed) openSetup();
 }
@@ -233,6 +237,7 @@ function handle(ev) {
         S.agents[ev.agent_id].status = p.status;
         S.agents[ev.agent_id].detail = p.detail || '';
       }
+      if (ev.agent_id === 'manager') composerHint();
       if (sp) {
         sp.state = p.status;
         // Work arrives - stop whatever social thing you were doing.
@@ -270,6 +275,12 @@ function handle(ev) {
     case 'user.message': pushFeed(ev); break;
     case 'office.budget':
       pushFeed({ ...ev, type: 'agent.error', payload: { text: p.reason } }); break;
+    case 'office.paused':
+      S.paused = p.reason || 'paused'; S.pausedUntil = p.resume_at || 0;
+      renderPaused(); pushFeed(ev); break;
+    case 'office.resumed':
+      S.paused = ''; S.pausedUntil = 0; renderPaused(); pushFeed(ev); break;
+    case 'router.decided': pushFeed(ev); break;
 
     /* ---- the social life of the office ---- */
     case 'social.break': {
@@ -2004,6 +2015,13 @@ function wireUI() {
   $('filesModal').addEventListener('click', (e) => {
     if (e.target === $('filesModal')) $('filesModal').classList.add('hidden');
   });
+  $('pauseBtn').onclick = async () => {
+    await fetch(S.paused ? '/api/resume' : '/api/pause', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(S.paused ? {} : { reason: 'paused by you' })
+    });
+  };
+  $('resumeBtn').onclick = () => $('pauseBtn').onclick();
   $('staffBtn').onclick = openStaff;
   $('staffClose').onclick = closeStaff;
   $('staffExport').onclick = exportOffice;
@@ -2098,6 +2116,57 @@ async function send() {
       body: JSON.stringify({ text, to })
     });
   } finally { $('send').disabled = false; input.focus(); }
+}
+
+async function sendTo(to, text) {
+  await fetch('/api/message', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, to })
+  });
+}
+
+async function cancelTask(id) {
+  await fetch('/api/task/cancel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  refreshTasks();
+}
+
+function renderPaused() {
+  const banner = $('pausedBanner');
+  const btn = $('pauseBtn');
+  if (!banner || !btn) return;
+  const on = !!S.paused;
+  banner.classList.toggle('hidden', !on);
+  btn.textContent = on ? '▶ Resume' : '⏸ Pause';
+  btn.classList.toggle('on', on);
+  if (on) {
+    $('pausedText').textContent = 'Paused: ' + S.paused;
+    tickPaused();
+  }
+}
+
+function tickPaused() {
+  const cd = $('pausedCountdown');
+  if (!cd || !S.paused) return;
+  if (!S.pausedUntil) { cd.textContent = 'until you resume'; return; }
+  const left = Math.max(0, Math.round(S.pausedUntil - Date.now() / 1000));
+  cd.textContent = left ? `resumes in ${ago(Date.now() / 1000 - left).replace(/^/, '')}` : 'resuming…';
+  setTimeout(tickPaused, 1000);
+}
+
+function composerHint() {
+  const m = S.agents.manager || {};
+  const input = $('msg');
+  if (!input) return;
+  if (m.status === 'waiting') {
+    input.placeholder = `Miles is waiting ${m.detail || 'on work'} — a new message queues behind it…`;
+  } else if (S.frontDesk) {
+    input.placeholder = 'Ask for anything — the front desk routes it, Miles delegates the rest…';
+  } else {
+    input.placeholder = "Ask Miles for something — he'll delegate it…";
+  }
 }
 
 async function decide(id, approved, response) {
@@ -2352,7 +2421,7 @@ function renderBoard() {
   const groups = [
     ['In progress', S.tasks.filter(t => t.status === 'running')],
     ['Queued', S.tasks.filter(t => t.status === 'queued')],
-    ['Finished', S.tasks.filter(t => ['done', 'partial', 'failed'].includes(t.status)).slice(0, 14)],
+    ['Finished', S.tasks.filter(t => ['done', 'partial', 'failed', 'cancelled'].includes(t.status)).slice(0, 14)],
   ];
   const board = $('board');
   board.innerHTML = '';
@@ -2388,6 +2457,21 @@ function renderBoard() {
         const why = String(t.stop || 'cap').replace(/_/g, ' ');
         card.querySelector('.cardMeta').appendChild(
           el('span', 'cardStop', `stopped early: ${why}`));
+      }
+      // What it cost, on the card. You cannot trim what you cannot see.
+      if (t.calls) {
+        const bits = [niceTokens(t.tokens) + ' tok', '$' + (t.cost || 0).toFixed(3)];
+        if (t.turns) bits.push(t.turns + ' turn' + (t.turns === 1 ? '' : 's'));
+        if (t.model) bits.push(t.model);
+        if (t.stop && t.status !== 'partial') bits.push('stopped: ' + String(t.stop).replace(/_/g, ' '));
+        card.appendChild(el('div', 'cardFoot', bits.join(' · ')));
+      }
+      if (t.status === 'queued' || t.status === 'running') {
+        const meta = card.querySelector('.cardMeta');
+        const x = el('button', 'cardCancel', 'cancel');
+        x.title = 'Stop this task now';
+        x.onclick = (e) => { e.stopPropagation(); cancelTask(t.id); };
+        meta.appendChild(x);
       }
       const body = (t.status === 'failed' ? t.error : t.result) || t.brief || '';
       if (body) {
@@ -3068,6 +3152,22 @@ function appendLine(feed, ev) {
   else if (kind === 'scold') { text = `Miles: "${p.line}"`; cls = 'error'; }
   else if (kind === 'dismissed') { text = `sent back to their desk`; cls = 'social'; }
   else if (kind === 'patrol') { text = `walks the floor`; cls = 'social'; }
+  else if (kind === 'paused') {
+    who = { name: 'office', emoji: '⏸' };
+    text = `paused: ${p.reason}` + (p.resume_at
+      ? ` — resumes about ${new Date(p.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '');
+    cls = 'error';
+  }
+  else if (kind === 'resumed') { who = { name: 'office', emoji: '▶' }; text = 'resumed'; cls = 'social'; }
+  else if (kind === 'decided' && ev.type === 'router.decided') {
+    who = { name: 'front desk', emoji: '🛎️' };
+    const tgt = S.byId[p.target] || {};
+    text = p.action === 'answer' ? `answered directly (${Math.round(p.confidence * 100)}%)`
+      : p.action === 'route' ? `sent straight to ${tgt.name || p.target} (${Math.round(p.confidence * 100)}%)`
+      : `passed to Miles` + (p.confidence ? ` (${Math.round(p.confidence * 100)}% < floor)` : '');
+    text += p.ms ? ` · ${p.ms} ms` : '';
+    cls = 'desk';
+  }
   else if (kind === 'changed') {
     // Roster events are about the office, not the person. Rebind rather than
     // mutate: `who` is the live S.byId entry when the agent still exists.
@@ -3088,6 +3188,13 @@ function appendLine(feed, ev) {
     `<span class="who" style="color:${(S.byId[ev.agent_id] || {}).color || ''}">` +
     `${who.emoji} ${escapeHtml(who.name)}</span> ${escapeHtml(text)}`;
 
+  if (kind === 'message_user' && p.routed) {
+    const b = document.createElement('button');
+    b.className = 'escalate'; b.textContent = 'Escalate to Miles';
+    b.title = 'Hand this to the manager to redo with the full team';
+    b.onclick = () => sendTo('manager', `Please take over this request and check the answer ${who.name} gave: ${p.text}`.slice(0, 1500));
+    el.appendChild(b);
+  }
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
   feed.appendChild(el);
   while (feed.children.length > 200) feed.removeChild(feed.firstChild);

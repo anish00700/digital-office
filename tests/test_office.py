@@ -17,6 +17,10 @@ import threading
 import pytest
 
 os.environ.setdefault("OFFICE_BACKEND", "mock")
+# This module imports office.llm first in a pytest session, and the mock's
+# failure rate is read when the backend is built. Without this the 18% demo
+# failure rate leaked into every other module's delegation tests.
+os.environ.setdefault("OFFICE_MOCK_FAILURE_RATE", "0")
 _TMP = tempfile.mkdtemp(prefix="office-test-office-")
 os.environ.setdefault("OFFICE_DATA_DIR", os.path.join(_TMP, "data"))
 os.environ.setdefault("OFFICE_WORKSPACE", os.path.join(_TMP, "workspace"))
@@ -325,7 +329,9 @@ def test_sdk_stop_reasons_map_to_one_vocabulary():
     assert stop(subtype="error_max_budget_usd", is_error=True) == "budget_exhausted"
     assert stop(subtype="success", stop_reason="end_turn") == "end_turn"
     assert stop(subtype="success", terminal_reason="completed") == "end_turn"
-    assert stop(subtype="success", is_error=True, api_status=429) == "api_error"
+    assert stop(subtype="success", is_error=True, api_status=429) == "rate_limited"
+    assert stop(subtype="success", is_error=True, api_status=529) == "rate_limited"
+    assert stop(subtype="success", is_error=True, api_status=500) == "api_error"
     assert stop(subtype="error_during_execution", is_error=True) == "error_during_execution"
     assert stop(terminal_reason="aborted_streaming") == "cancelled"
     assert stop(subtype="success", stop_reason="max_tokens") == "max_tokens"

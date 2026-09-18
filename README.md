@@ -280,9 +280,23 @@ default; the ones that cost money are marked `BUDGET` in the source.
   re-sent on every request, so the tool surface is a recurring tax.
 - Tool descriptions are one line each, deliberately.
 
+**The front desk answers before Miles is woken**
+- A Haiku classifier with no tools reads each message first (~500 tokens). A
+  greeting or a question it can answer from the staff list is answered as Miles;
+  a request one specialist can do whole goes straight to them as a task, and their
+  result is posted back to chat. Everything else, and anything under the
+  confidence floor, goes to Miles exactly as before. Measured live, one manager
+  turn is ~7k prompt tokens, which is what each routed message saves.
+- `OFFICE_ROUTER=0` turns it off. `OFFICE_ROUTER_CONFIDENCE` (0.8) is the floor.
+  The feed shows every decision with its confidence and latency; the usage modal
+  lists the front desk's own spend under its own name.
+- Routed replies carry an **Escalate to Miles** link if the specialist got it wrong.
+
 **Work is kept short**
 - Every task starts from a clean context. Sessions are never resumed, so history
-  does not compound across tasks.
+  does not compound across tasks. Miles alone sees the last few exchanges
+  (`OFFICE_MANAGER_MEMORY`, 6), clipped, in the user turn rather than the system
+  prompt so the cached prefix stays identical.
 - `effort: low` for workers, `medium` for the manager. Lower effort means fewer,
   more consolidated tool calls and less preamble.
 - `max_turns` caps tool round trips per role (5–14). A task that hits its cap
@@ -303,6 +317,20 @@ default; the ones that cost money are marked `BUDGET` in the source.
   share of prompt tokens read back from cache. A persona alone is often below
   the minimum cacheable prefix, so a figure near 0% on a live backend means the
   stable prefix needs to be longer, not that caching is off.
+
+**Every task shows what it cost**
+- Task cards carry tokens, cost, API turns and model. Usage rows are attributed to
+  the task that caused them, so the ledger says what was spent on, not only by whom.
+
+**A rate limit pauses the office; it does not fail anyone**
+- When the backend reports a rate limit (429/529, or the CLI's own wording), the
+  task is kept, the office pauses with a resume time from the error's Retry-After
+  or `OFFICE_RATE_LIMIT_PAUSE` (300s), a banner shows the countdown, and work
+  resumes on its own. Nobody is summoned to the manager's office for the plan's
+  five-hour window. A `wait` in progress returns at once and tells Miles why.
+- **Pause** in the top bar (or `POST /api/pause`) parks the office by hand; queued
+  work waits, running calls finish. **cancel** on a queued or running card stops
+  that task now and its worker takes the next one.
 
 **Spend is bounded**
 - `OFFICE_TASK_BUDGET_USD` (default $0.15) is enforced by the SDK per task.

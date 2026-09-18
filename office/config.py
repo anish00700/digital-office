@@ -95,6 +95,22 @@ ISOLATE_CLAUDE_CONFIG = os.environ.get("OFFICE_ISOLATE_CLAUDE_CONFIG", "1").stri
     not in ("0", "false", "no", "off")
 CLAUDE_CONFIG_DIR = DATA_DIR / "claude"
 
+# -- token architecture ------------------------------------------------------
+# A Haiku "front desk" reads each message before Miles does. A greeting, a
+# one-line question, or a request one specialist can do whole never pays for
+# a Sonnet manager turn with ten tool definitions (~7k prompt tokens, measured).
+# Below the confidence floor, or for anything with two asks, a follow-up
+# reference, or a judgement call, it hands over to Miles. OFFICE_ROUTER=0
+# turns it off; every message then goes to Miles as before.
+ROUTER = os.environ.get("OFFICE_ROUTER", "1").strip() not in ("0", "false", "no", "off")
+ROUTER_CONFIDENCE = min(1.0, max(0.0, float(os.environ.get("OFFICE_ROUTER_CONFIDENCE", "0.8"))))
+# A rate limit from the backend pauses the whole office - tasks wait, nobody is
+# scolded - for this long, unless the error says when to come back.
+RATE_LIMIT_PAUSE_S = max(30, int(os.environ.get("OFFICE_RATE_LIMIT_PAUSE", "300")))
+# How many recent exchanges Miles sees with each new message, so "now do the
+# same for prod" refers to something. Each is clipped, so this stays cheap.
+MANAGER_MEMORY = max(0, int(os.environ.get("OFFICE_MANAGER_MEMORY", "6")))
+
 # -- who this office works for ---------------------------------------------
 # Personas write {principal} rather than naming a profession, and it is
 # substituted at request time. An office that hardcodes its owner's job into
@@ -292,7 +308,7 @@ _ROLE_LIST = (
         max_turns=14,
         reports_to="",
         office_tools=("list_staff", "assign", "wait", "task_status",
-                      "message_user", "remember", "recall",
+                      "message_user", "remember", "recall", "now",
                       "read_context", "write_context", "learn"),
         # Miles keeps the office's written memory: the shared context file and,
         # at the end of a session, the handoff. No skill for it, deliberately:

@@ -151,6 +151,22 @@ def _drop_skill(db, name):
                        (json.dumps(kept), row["id"]))
 
 
+def _add_tool(db, role_id, tool):
+    """Grant one office tool to one roster row if it lacks it. Migration
+    helper; safe to run twice."""
+    row = db.execute("SELECT office_tools FROM roster WHERE id=?", (role_id,)).fetchone()
+    if row is None:
+        return
+    try:
+        tools = list(json.loads(row["office_tools"] or "[]"))
+    except (TypeError, ValueError):
+        return
+    if tool not in tools:
+        tools.append(tool)
+        db.execute("UPDATE roster SET office_tools=? WHERE id=?",
+                   (json.dumps(tools), role_id))
+
+
 class Store:
     def __init__(self, path=None):
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -179,6 +195,13 @@ class Store:
         # every task - into every manager request. Offices seeded before the
         # default changed still carry the grant in their roster row.
         ("roster.no_session_handoff", lambda db: _drop_skill(db, "session-handoff")),
+        # Which task a model call belonged to, and how many API turns it took.
+        # Without these the ledger says who spent, never on what.
+        ("usage.task_id", "ALTER TABLE usage ADD COLUMN task_id TEXT"),
+        ("usage.turns", "ALTER TABLE usage ADD COLUMN turns INTEGER DEFAULT 0"),
+        # Miles had no clock: asked the time he answered "no exact clock time
+        # available". The DB row wins over the config default, so upgrade it.
+        ("roster.manager_now", lambda db: _add_tool(db, "manager", "now")),
     )
 
     def _migrate(self):
@@ -366,10 +389,29 @@ class Store:
     def task(self, task_id):
         return self._run("SELECT * FROM tasks WHERE id=?", (task_id,), fetch="one")
 
+    # Every task row carries what it cost. The join is cheap (usage is small
+    # and indexed by task) and it is the only way a card can say
+    # "12.4k tok · $0.03 · 4 turns · sonnet" instead of just "done".
+    _TASK_COLS = (
+        "t.*,"
+        " COALESCE(SUM(u.input_tokens+u.output_tokens+u.cache_read+u.cache_write),0) tokens,"
+        " COALESCE(SUM(u.cost_usd),0) cost,"
+        " COALESCE(SUM(u.turns),0) turns,"
+        " COUNT(u.id) calls,"
+        " MAX(u.model) model"
+    )
+
     def tasks(self, limit=200):
         return self._run(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,), fetch="all"
+            f"SELECT {self._TASK_COLS} FROM tasks t LEFT JOIN usage u ON u.task_id=t.id"
+            " GROUP BY t.id ORDER BY t.created_at DESC LIMIT ?", (limit,), fetch="all"
         )
+
+    def task_usage(self, task_id):
+        return self._run(
+            "SELECT COALESCE(SUM(input_tokens+output_tokens+cache_read+cache_write),0) tokens,"
+            " COALESCE(SUM(cost_usd),0) cost, COALESCE(SUM(turns),0) turns, COUNT(*) calls,"
+            " MAX(model) model FROM usage WHERE task_id=?", (task_id,), fetch="one")
 
     # -- events ------------------------------------------------------------
     def add_event(self, etype, agent_id=None, task_id=None, payload=None):
@@ -497,8 +539,8 @@ class Store:
         self._run("UPDATE reminders SET fired=1 WHERE id=?", (rid,))
 
     # -- usage -------------------------------------------------------------
-    def add_usage_row(self, agent_id, model, turn):
-        """Record one agent turn. `turn` is an llm.Turn.
+    def add_usage_row(self, agent_id, model, turn, task_id=None):
+        """Record one agent run. `turn` is an llm.Turn.
 
         Cost is stored as reported when the backend knows it (the Agent SDK
         does), and estimated from list prices otherwise.
@@ -506,10 +548,31 @@ class Store:
         cost = turn.cost_usd or self._estimate(model, turn)
         self._run(
             "INSERT INTO usage (ts,agent_id,model,input_tokens,output_tokens,"
-            "cache_read,cache_write,cost_usd) VALUES (?,?,?,?,?,?,?,?)",
+            "cache_read,cache_write,cost_usd,task_id,turns) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (time.time(), agent_id, model, turn.input_tokens, turn.output_tokens,
-             turn.cache_read, turn.cache_write, cost),
+             turn.cache_read, turn.cache_write, cost, task_id,
+             getattr(turn, "turns", 0) or 0),
         )
+
+    def router_stats(self, since=0.0):
+        """What the front desk did in the window: how often it answered,
+        routed, or handed over, and how long it took to decide."""
+        rows = self._run(
+            "SELECT payload FROM events WHERE type='router.decided' AND ts >= ?",
+            (since,), fetch="all") or []
+        out = {"n": 0, "answered": 0, "routed": 0, "manager": 0, "avg_ms": 0}
+        total_ms = 0
+        for r in rows:
+            try:
+                p = json.loads(r["payload"] or "{}")
+            except ValueError:
+                continue
+            out["n"] += 1
+            out[{"answer": "answered", "route": "routed"}.get(p.get("action"), "manager")] += 1
+            total_ms += int(p.get("ms") or 0)
+        if out["n"]:
+            out["avg_ms"] = round(total_ms / out["n"])
+        return out
 
     @staticmethod
     def _estimate(model, turn):

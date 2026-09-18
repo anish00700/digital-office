@@ -19,7 +19,9 @@ size, and start every task from a clean context instead of resuming a session.
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import random
 import re
@@ -27,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import config
+
+log = logging.getLogger("office.llm")
 
 
 @dataclass
@@ -42,6 +46,17 @@ class Turn:
     error: str = ""
     turns: int = 0            # model calls the run took (SDK: num_turns)
     api_status: int = 0       # HTTP status of a failing API call, else 0
+    retry_after: float = 0.0  # seconds the backend asked us to wait, if it said
+
+
+# A rate limit is the office's problem, not the employee's: nine tasks failing
+# at once with "429" used to read as nine people being called into the
+# manager's office. Detection lives here, in one place, for every backend.
+# On the agentsdk backend the only signal is the CLI's prose, so the raw text
+# is logged on every match - a false positive must be diagnosable.
+RATE_LIMIT_PATTERNS = re.compile(
+    r"rate.?limit|too many requests|\b429\b|\b529\b|overloaded|usage limit|"
+    r"quota|capacity|hit your limit|limit reached", re.I)
 
 
 # Ways a run can end that are the office's own caps, not the agent's fault.
@@ -66,6 +81,8 @@ def _sdk_stop(subtype="", terminal_reason="", stop_reason="", api_status=0,
         return "budget_exhausted"
     if terminal_reason.startswith("aborted"):
         return "cancelled"
+    if api_status in (429, 529):
+        return "rate_limited"
     if api_status:
         return "api_error"
     if subtype.startswith("error"):
@@ -314,6 +331,10 @@ class AgentSDKBackend:
             else:
                 turn.error = f"{type(exc).__name__}: {exc}"
 
+        if turn.error and turn.stop != "rate_limited" \
+                and RATE_LIMIT_PATTERNS.search(turn.error):
+            log.info("rate limit inferred from CLI text: %r", turn.error[:300])
+            turn.stop = "rate_limited"
         if turn.error:
             on_event("error", text=turn.error)
         elif turn.stop in PARTIAL_STOPS:
@@ -321,6 +342,50 @@ class AgentSDKBackend:
 
         turn.text = "\n\n".join(t.strip() for t in texts if t.strip())
         return turn
+
+    async def structured(self, system, prompt, schema, model=""):
+        """One cheap, tool-less call that must answer in `schema`. Used by the
+        front desk. Returns (data or None, Turn) - usage is the caller's to
+        record."""
+        sdk = self._sdk
+        options = sdk.ClaudeAgentOptions(
+            system_prompt=system,
+            setting_sources=[],
+            tools=[],
+            allowed_tools=[],
+            model=model or config.MODEL_CHEAP,
+            fallback_model=config.MODEL_SMART,
+            max_turns=1,
+            output_format={"type": "json_schema", "schema": schema},
+            permission_mode="default",
+            cwd=str(config.WORKSPACE),
+            include_partial_messages=False,
+        )
+        turn, data = Turn(), None
+        try:
+            async for message in sdk.query(prompt=prompt, options=options):
+                if type(message).__name__ != "ResultMessage":
+                    continue
+                data = getattr(message, "structured_output", None)
+                if data is None and getattr(message, "result", None):
+                    with contextlib.suppress(ValueError, TypeError):
+                        data = json.loads(message.result)
+                turn.cost_usd = getattr(message, "total_cost_usd", None) or 0.0
+                turn.turns = getattr(message, "num_turns", 0) or 0
+                usage = getattr(message, "usage", None) or {}
+                pull = (usage.get if isinstance(usage, dict)
+                        else lambda k, d=0: getattr(usage, k, d))
+                turn.input_tokens = pull("input_tokens", 0) or 0
+                turn.output_tokens = pull("output_tokens", 0) or 0
+                turn.cache_read = pull("cache_read_input_tokens", 0) or 0
+                turn.cache_write = pull("cache_creation_input_tokens", 0) or 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            turn.error = f"{type(exc).__name__}: {exc}"
+            if RATE_LIMIT_PATTERNS.search(turn.error):
+                turn.stop = "rate_limited"
+        return (data if isinstance(data, dict) else None), turn
 
 
 def _short_tool(name):
@@ -418,9 +483,16 @@ class APIBackend:
                 break
             except anthropic.RateLimitError as exc:
                 turn.error = f"rate limited: {exc}"
+                turn.stop = "rate_limited"
+                turn.api_status = 429
+                turn.retry_after = _retry_after(exc)
                 break
             except anthropic.APIStatusError as exc:
                 turn.error = f"api error {exc.status_code}: {exc.message}"
+                turn.api_status = exc.status_code or 0
+                if exc.status_code == 529:          # overloaded: same treatment
+                    turn.stop = "rate_limited"
+                    turn.retry_after = _retry_after(exc)
                 break
             except anthropic.APIConnectionError as exc:
                 turn.error = f"connection error: {exc}"
@@ -482,6 +554,48 @@ class APIBackend:
         return turn
 
 
+    async def structured(self, system, prompt, schema, model=""):
+        return await asyncio.to_thread(self._structured_sync, system, prompt, schema, model)
+
+    def _structured_sync(self, system, prompt, schema, model):
+        anthropic = self._anthropic
+        model = self._model(model or config.MODEL_CHEAP)
+        turn, data = Turn(), None
+        try:
+            resp = self.client.messages.create(
+                model=model, max_tokens=400,
+                system=[{"type": "text", "text": system,
+                         "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                messages=[{"role": "user", "content": prompt}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
+            u = resp.usage
+            turn.input_tokens = getattr(u, "input_tokens", 0) or 0
+            turn.output_tokens = getattr(u, "output_tokens", 0) or 0
+            turn.cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+            turn.cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+            turn.turns = 1
+            text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            with contextlib.suppress(ValueError, TypeError):
+                data = json.loads(text)
+        except anthropic.RateLimitError as exc:
+            turn.error, turn.stop = f"rate limited: {exc}", "rate_limited"
+            turn.retry_after = _retry_after(exc)
+        except Exception as exc:
+            turn.error = f"{type(exc).__name__}: {exc}"
+        turn.cost_usd = _estimate_cost(model, turn)
+        return (data if isinstance(data, dict) else None), turn
+
+
+def _retry_after(exc):
+    """Seconds from a Retry-After header, if the SDK exposed one."""
+    try:
+        value = exc.response.headers.get("retry-after")
+        return float(value) if value else 0.0
+    except Exception:
+        return 0.0
+
+
 def _json_schema(simple):
     """Our ToolSpec.schema uses the SDK's simple {name: type} form; the
     Messages API needs real JSON Schema."""
@@ -516,7 +630,13 @@ class MockBackend:
     # Some tasks fail on purpose. Without failures you never see the approval
     # queue or the manager's office get used, which is half the point of a
     # free demo mode. Set to 0 for a suspiciously harmonious workplace.
-    FAILURE_RATE = float(os.environ.get("OFFICE_MOCK_FAILURE_RATE", "0.18"))
+    FAILURE_RATE = 0.18
+
+    def __init__(self):
+        # Read when built, not when imported: the value must follow the
+        # environment of the process that starts the office, not of whoever
+        # imported this module first.
+        self.FAILURE_RATE = float(os.environ.get("OFFICE_MOCK_FAILURE_RATE", "0.18"))
 
     EXCUSES = (
         "connection refused talking to the staging host",
@@ -559,14 +679,35 @@ class MockBackend:
         turn.output_tokens = random.randint(80, 260)
         return turn
 
+    async def structured(self, system, prompt, schema, model=""):
+        """A keyword front desk: enough to show every path in the demo."""
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        turn = Turn(input_tokens=random.randint(300, 500), output_tokens=random.randint(20, 60),
+                    turns=1)
+        text = prompt.rsplit("Message:", 1)[-1].strip().lower()
+        words = text.split()
+        if text.startswith(("hi", "hello", "thanks", "thank you")) and len(words) <= 6:
+            return {"action": "answer", "target": "", "confidence": 0.95,
+                    "reply": "[mock] Hello! Send me anything and I'll get it to the right person."}, turn
+        if " and " in text or " then " in text or " same " in text or " that " in text:
+            return {"action": "manager", "target": "", "confidence": 0.9, "reply": ""}, turn
+        for r in config.ROSTER:
+            if r.id == config.MANAGER_ID:
+                continue
+            if r.name.lower() in text or r.id in text:
+                return {"action": "route", "target": r.id, "confidence": 0.92, "reply": ""}, turn
+        return {"action": "manager", "target": "", "confidence": 0.6, "reply": ""}, turn
+
     async def _mock_manager(self, req, ctx, on_event):
         specs = {s.name: s for s in req.tools}
+        # The prompt carries the recent conversation ahead of the message;
+        # a real manager writes its own brief, the mock just echoes the ask.
+        ask = req.prompt.rsplit("New message:\n", 1)[-1].strip()
         if "assign" in specs and random.random() < 0.85:
             target = random.choice(config.STAFF_IDS)
             on_event("tool", tool="assign", args=target)
             await specs["assign"].handler(
-                {"assignee": target, "title": truncate(req.prompt, 40),
-                 "brief": req.prompt}, ctx)
+                {"assignee": target, "title": truncate(ask, 40), "brief": ask}, ctx)
             if "wait" in specs:
                 on_event("tool", tool="wait", args="")
                 await specs["wait"].handler({"task_ids": ""}, ctx)

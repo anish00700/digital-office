@@ -307,6 +307,22 @@ body {
 .card.done:hover, .card.open { opacity: 1; }
 .card.failed { border-left-color: var(--bad); }
 .card.partial { border-left-color: var(--warn); }
+.card.cancelled { opacity: .5; border-left-color: var(--ink-dim); }
+.dotStatus.cancelled { background: var(--ink-dim); }
+.cardFoot { font-size: 11px; color: var(--ink-dim); margin-top: 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cardCancel { margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 6px;
+  background: transparent; color: var(--ink-dim); border: 1px solid var(--line); cursor: pointer; }
+.cardCancel:hover { color: var(--bad); border-color: var(--bad); }
+.banner { display: flex; gap: 12px; align-items: center; padding: 7px 16px;
+  background: rgba(217,164,65,.16); border-bottom: 1px solid rgba(217,164,65,.4);
+  color: var(--warn); font-size: 13px; }
+.banner .btn-ok.small { padding: 3px 10px; font-size: 12px; margin-left: auto; }
+.pill.ghostPill { background: transparent; color: var(--ink-dim); border-color: var(--line); }
+.pill.ghostPill:hover { color: var(--ink); }
+.pill.ghostPill.on { color: var(--warn); border-color: rgba(217,164,65,.5); }
+.escalate { margin-left: 8px; font-size: 11px; color: var(--accent); cursor: pointer;
+  background: none; border: none; padding: 0; text-decoration: underline; }
+.line.desk { color: var(--ink-dim); font-style: italic; }
 .cardStop { font-size: 11px; color: var(--warn); margin-left: auto; white-space: nowrap; }
 
 /* ---- feed ------------------------------------------------------------- */

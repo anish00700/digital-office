@@ -23,7 +23,13 @@
   <button id="filesBtn" class="pill" title="Files your staff have written">📁 Files</button>
   <button id="staffBtn" class="pill" title="Hire, edit and let go of employees">👥 Staff</button>
   <button id="approvalsBtn" class="pill hidden">⚠ <span id="approvalsCount">0</span> waiting on you</button>
+  <button id="pauseBtn" class="pill ghostPill" title="Stop starting new model calls; running work finishes">⏸ Pause</button>
 </header>
+<div id="pausedBanner" class="banner hidden">
+  <span id="pausedText">Paused</span>
+  <span id="pausedCountdown" class="muted"></span>
+  <button id="resumeBtn" class="btn-ok small">Resume</button>
+</div>
 
 <main class="layout">
 

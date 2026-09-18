@@ -158,7 +158,7 @@ WAIT_RESULT_CHARS = 1200
 WAIT_ERROR_CHARS = 400
 
 
-def _wait_entry(task_id, row):
+def _wait_entry(task_id, row, paused=""):
     status = row.get("status") or "unknown"
     stop = row.get("stop") or ""
     label = status
@@ -166,7 +166,14 @@ def _wait_entry(task_id, row):
         label = f"partial - stopped at {stop.replace('_', ' ')}, not finished"
     head = f"--- {task_id} [{label}] {row.get('title', '')}"
     if status in ("queued", "running"):
+        if paused:
+            # A wait that returns during a pause must say so, or the manager
+            # sits for the full timeout on a task that cannot possibly finish.
+            return (head + f"\n(not started: the office is paused - {paused}. "
+                    "Do not wait again now; tell your principal and stop.)")
         return head + "\n(still running - wait again, or carry on without it)"
+    if status == "cancelled":
+        return head + "\n(cancelled by your principal - do not retry it)"
     result = row.get("result") or ""
     if result == "(no output)":
         result = ""
@@ -186,7 +193,9 @@ async def _wait(args, ctx):
     results = await ctx.office.wait_for(ids, requester=ctx.agent_id)
     if not results:
         return "nothing to wait for"
-    return "\n\n".join(_wait_entry(task_id, row) for task_id, row in results.items())
+    paused = ctx.office.paused_summary()
+    return "\n\n".join(_wait_entry(task_id, row, paused)
+                         for task_id, row in results.items())
 
 
 async def _task_status(args, ctx):

@@ -1,6 +1,6 @@
 {
   "format": "digital-office/1",
-  "exported_at": "2026-09-18T10:57:43+0530",
+  "exported_at": "2026-09-18T11:30:56+0530",
   "principal": "one person: your principal, a DevOps engineer. Assume deep technical fluency and skip basic infrastructure explanation",
   "pack": "devops",
   "staff": [
@@ -24,6 +24,7 @@
         "message_user",
         "remember",
         "recall",
+        "now",
         "read_context",
         "write_context",
         "learn"

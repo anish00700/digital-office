@@ -144,8 +144,23 @@ class Handler(BaseHTTPRequestHandler):
             text = (body.get("text") or "").strip()
             if not text:
                 return self._json({"error": "empty"}, 400)
-            self.office.submit_user_message(text, body.get("to"))
+            info = self.office.submit_user_message(text, body.get("to")) or {}
+            return self._json({"ok": True, **info})
+
+        if route == "/api/pause":
+            reason = (body.get("reason") or "paused by you").strip()[:120]
+            self.office.pause(reason)
+            return self._json({"ok": True, "paused": reason})
+
+        if route == "/api/resume":
+            self.office.resume()
             return self._json({"ok": True})
+
+        if route == "/api/task/cancel":
+            row = self.office.cancel_task((body.get("id") or "").strip())
+            if row is None:
+                return self._json({"error": "no such task, or it already finished"}, 404)
+            return self._json({"ok": True, "id": row["id"]})
 
         if route == "/api/approval":
             approval_id = body.get("id")
@@ -225,6 +240,9 @@ class Handler(BaseHTTPRequestHandler):
             },
             "backend": self.office.backend.name,
             "auth": self.office.backend.describe_auth(),
+            "paused": self.office._paused_reason or None,
+            "paused_until": self.office._paused_until or None,
+            "front_desk": bool(config.ROUTER and hasattr(self.office.backend, "structured")),
             "setup_needed": roster.setup_needed(store),
             "principal": self.office.principal(),
             "started_at": self.office.started_at,
@@ -357,12 +375,13 @@ class Handler(BaseHTTPRequestHandler):
             role = by_id.get(row["agent_id"])
             turns = row["turns"] or 1
             mine = [r for r in rows if r["agent_id"] == row["agent_id"]]
+            desk = row["agent_id"] == "router"
             agents.append({
                 **row,
-                "name": role.name if role else row["agent_id"],
-                "emoji": role.emoji if role else "👤",
+                "name": "Front desk" if desk else (role.name if role else row["agent_id"]),
+                "emoji": "🛎️" if desk else (role.emoji if role else "👤"),
                 "color": role.color if role else "#8a8580",
-                "departed": role is None,
+                "departed": role is None and not desk,
                 "model_id": role.model_id if role else "",
                 "max_turns": role.max_turns if role else 0,
                 "tool_count": (len(role.office_tools) + len(role.native_tools)) if role else 0,
@@ -384,6 +403,7 @@ class Handler(BaseHTTPRequestHandler):
             "recent": store.usage_recent(since, limit=40),
             "token_budget": config.SESSION_TOKEN_BUDGET,
             "session_window_seconds": config.SESSION_WINDOW_S,
+            "router": store.router_stats(since),
         }
 
     # -- workspace ------------------------------------------------------

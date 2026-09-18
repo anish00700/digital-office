@@ -6,10 +6,12 @@ reaches in through `submit_*` / `decide_*`, which marshal onto this loop.
 
 import asyncio
 import contextlib
+import hashlib
+import datetime as dt
 import logging
 import time
 
-from . import config, llm, notebook, roster, tools
+from . import config, llm, notebook, roster, router, tools
 from .bus import EventBus
 from .social import SocialLife
 from .store import Store
@@ -70,6 +72,12 @@ class Office:
         self._workers = []
         self._staff_tasks = {}      # agent_id -> its worker task, so we can fire one
         self._paused_reason = ""
+        self._paused_until = 0.0
+        self._resume = None          # asyncio.Event, created on the loop
+        self._paused_event = None    # set while paused; wait_for watches it
+        self._current = {}           # agent_id -> the asyncio.Task running its job
+        self._cancelled = set()      # task ids cancelled while queued or running
+        self._last_message = ("", 0.0)
         # One gate for every model call; see config.MAX_CONCURRENT.
         self._model_slots = asyncio.Semaphore(config.MAX_CONCURRENT)
         self._last_prune = 0.0
@@ -78,6 +86,14 @@ class Office:
     # -- lifecycle ------------------------------------------------------
     async def start(self):
         self.loop = asyncio.get_running_loop()
+        self._resume = asyncio.Event()
+        self._resume.set()
+        self._paused_event = asyncio.Event()
+        # Messages are classified one at a time, in the order they arrived.
+        # Concurrent classification let a quick second message reach Miles'
+        # queue ahead of a slow first one - "actually, cancel that" before
+        # the thing it cancelled.
+        self._desk_lock = asyncio.Lock()
         config.WORKSPACE.mkdir(parents=True, exist_ok=True)
         # Seeds from config.DEFAULT_ROSTER on first boot; the table wins after.
         roster.load(self.store)
@@ -136,6 +152,8 @@ class Office:
             "ok": True,
             "backend": self.backend.name,
             "paused": self._paused_reason or None,
+            "paused_until": self._paused_until or None,
+            "front_desk": bool(config.ROUTER and hasattr(self.backend, "structured")),
             "uptime_s": round(now - self.started_at),
             "workers_alive": {aid: (not t.done()) for aid, t in self._staff_tasks.items()},
             "queue_depth": {aid: q.qsize() for aid, q in self.queues.items()},
@@ -159,6 +177,91 @@ class Office:
         for task in running:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    # -- pause, resume, cancel ----------------------------------------------
+    # All three are safe from any thread: they marshal onto the office loop.
+    def pause(self, reason, resume_at=0.0):
+        """Stop starting model calls. Running ones finish; queued work waits.
+        Nobody is marked failed and nobody is scolded - a pause is the
+        office's condition, not an employee's mistake."""
+        def _do():
+            already = bool(self._paused_reason)
+            self._paused_reason = reason
+            self._paused_until = float(resume_at or 0.0)
+            self._resume.clear()
+            self._paused_event.set()
+            if not already:
+                log.info("paused: %s (until %s)", reason, self._paused_until or "manual")
+            self.bus.publish("office.paused", reason=reason,
+                             resume_at=self._paused_until or None)
+        self._on_loop(_do)
+
+    def resume(self):
+        def _do():
+            if not self._paused_reason:
+                return
+            log.info("resumed")
+            self._paused_reason, self._paused_until = "", 0.0
+            self._paused_event.clear()
+            self._resume.set()
+            self.bus.publish("office.resumed")
+        self._on_loop(_do)
+
+    def paused_summary(self):
+        if not self._paused_reason:
+            return ""
+        if self._paused_until:
+            when = time.strftime("%H:%M", time.localtime(self._paused_until))
+            return f"{self._paused_reason} (resumes about {when})"
+        return self._paused_reason
+
+    def cancel_task(self, task_id):
+        """Stop a task now, wherever it is. Queued: it is skipped when its
+        worker reaches it. Running: the worker's current job is cancelled -
+        which ends the model call - and the worker takes the next one."""
+        row = self.store.task(task_id)
+        if row is None or row["status"] not in ("queued", "running"):
+            return None
+        def _do():
+            self._cancelled.add(task_id)
+            # "queued" in the database can still mean a worker holds it -
+            # parked on a pause, or waiting for a model slot. If its job is
+            # live, cancel the job; the worker's except branch settles the row.
+            job = self._current.get(row["assignee"])
+            if job is not None and not job.done() and job.get_name() == f"job:{task_id}":
+                job.cancel()
+                return
+            self._finish_cancelled(row["assignee"], task_id)
+        self._on_loop(_do)
+        return row
+
+    def _finish_cancelled(self, agent_id, task_id):
+        self._cancelled.discard(task_id)
+        self.store.update_task(task_id, status="cancelled", stop="cancelled",
+                               error="cancelled by your principal",
+                               finished_at=time.time())
+        self.bus.publish("task.updated", agent_id=agent_id, task_id=task_id,
+                         status="cancelled")
+        event = self._task_events.pop(task_id, None)
+        if event is not None:
+            event.set()
+
+    def _on_loop(self, fn):
+        try:
+            on_loop = asyncio.get_running_loop() is self.loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            fn()
+        else:
+            self.loop.call_soon_threadsafe(fn)
+
+    async def _await_resume(self, agent_id, detail):
+        """Park until the office is running again. Shows why on the floor."""
+        if self._resume.is_set():
+            return
+        self._set_status(agent_id, "queued", f"paused: {detail}"[:80])
+        await self._resume.wait()
 
     # -- hiring and firing ------------------------------------------------
     # The store write happens on the calling (HTTP) thread - Store has its own
@@ -268,16 +371,103 @@ class Office:
         extra model call to be told what you just said.
         """
         to = (to or "").strip()
+        # A double-click on Send, or a retried POST, is one request, not two.
+        digest = hashlib.sha1(f"{to}|{text}".encode()).hexdigest()
+        last, at = self._last_message
+        if digest == last and time.time() - at < 5:
+            return {"duplicate": True}
+        self._last_message = (digest, time.time())
+
         if to and to != config.MANAGER_ID and to in config.STAFF_IDS:
             self.store.add_message("user", to, text)
             self.bus.publish("user.message", text=text, to=to)
-            title = " ".join(text.split())[:60] or "Direct request"
-            asyncio.run_coroutine_threadsafe(
-                self.assign(to, title, text, created_by="user"), self.loop)
-            return
+            asyncio.run_coroutine_threadsafe(self._route_to(to, text), self.loop)
+            return {"to": to}
         self.store.add_message("user", config.MANAGER_ID, text)
         self.bus.publish("user.message", text=text)
-        self.loop.call_soon_threadsafe(self.queues[config.MANAGER_ID].put_nowait, text)
+        if config.ROUTER and to != config.MANAGER_ID and hasattr(self.backend, "structured"):
+            asyncio.run_coroutine_threadsafe(self._front_desk(text), self.loop)
+        else:
+            self.loop.call_soon_threadsafe(self.queues[config.MANAGER_ID].put_nowait, text)
+        return {"to": config.MANAGER_ID}
+
+    async def _front_desk(self, text):
+        """Classify, then answer / route / hand to Miles. Any doubt, any
+        error, any low confidence: Miles, exactly as if the desk were not
+        there."""
+        now_text = (dt.datetime.now(config.TZ) if config.TZ
+                    else dt.datetime.now().astimezone()).strftime("%Y-%m-%d %H:%M %Z (%A)")
+        async with self._desk_lock:
+            await self._front_desk_locked(text, now_text)
+
+    async def _front_desk_locked(self, text, now_text):
+        decision, turn, ms = None, None, 0
+        try:
+            decision, turn, ms = await router.classify(self, text, now_text)
+        except Exception:
+            log.exception("front desk crashed; handing to the manager")
+        if turn is not None:
+            self.store.add_usage_row("router", config.MODEL_CHEAP, turn)
+            self.bus.publish("usage", agent_id="router", cost=turn.cost_usd,
+                             tokens=turn.input_tokens + turn.output_tokens
+                             + turn.cache_read + turn.cache_write,
+                             spend=self._spend_windows())
+        action = (decision or {}).get("action", "manager")
+        conf = (decision or {}).get("confidence", 0.0)
+        if action != "manager" and conf < config.ROUTER_CONFIDENCE:
+            action = "manager"
+        if action == "answer":
+            self._say_to_user(decision["reply"])
+        elif action == "route":
+            await self._route_to(decision["target"], text, via_desk=True)
+        else:
+            self.queues[config.MANAGER_ID].put_nowait(text)
+        self.bus.publish("router.decided", action=action,
+                         target=(decision or {}).get("target", ""),
+                         confidence=round(conf, 2), ms=ms,
+                         floor=config.ROUTER_CONFIDENCE)
+
+    async def _route_to(self, agent_id, text, via_desk=False):
+        """A request that skips Miles still gets its answer in chat. The
+        direct 'To' path used to finish in silence: the task card was the
+        only place the result existed."""
+        title = " ".join(text.split())[:60] or "Direct request"
+        try:
+            task_id = await self.assign(agent_id, title, text, created_by="user")
+        except KeyError:
+            self.queues[config.MANAGER_ID].put_nowait(text)
+            return
+        asyncio.create_task(self._reply_when_done(task_id, agent_id, via_desk),
+                            name=f"reply:{task_id}")
+
+    async def _reply_when_done(self, task_id, agent_id, via_desk):
+        event = self._task_events.get(task_id)
+        if event is not None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(event.wait(), WAIT_TIMEOUT_S * 4)
+        row = self.store.task(task_id)
+        if row is None:
+            return
+        status = row["status"]
+        if status == "done":
+            text = row["result"] or "(no output)"
+        elif status == "partial":
+            text = (f"{row['result'] or ''}\n\n(I ran out of "
+                    f"{(row['stop'] or 'room').replace('_', ' ')} before finishing.)").strip()
+        elif status == "cancelled":
+            return
+        elif status in ("queued", "running"):
+            text = "Still working on this - it has been a while. Check the task board."
+        else:
+            text = f"I couldn't finish this: {row['error'] or 'unknown error'}"
+        self.store.add_message(agent_id, "user", text, task_id)
+        self.bus.publish("agent.message_user", agent_id=agent_id, task_id=task_id,
+                         text=text, routed=via_desk, status=status)
+
+    def _spend_windows(self):
+        now = time.time()
+        return {"session": self.store.spend(now - config.SESSION_WINDOW_S),
+                "day": self.store.spend(now - 86400), "total": self.store.spend()}
 
     def decide_approval(self, approval_id, approved, response=""):
         row = self.store.decide_approval(
@@ -321,8 +511,19 @@ class Office:
         events = [self._task_events.get(t) for t in task_ids]
         pending = [e.wait() for e in events if e is not None]
         if pending:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*pending), WAIT_TIMEOUT_S)
+            # Also return the moment the office pauses: a task that cannot
+            # start will not finish, and 900s of silence helps nobody.
+            all_done = asyncio.ensure_future(asyncio.gather(*pending))
+            paused = asyncio.ensure_future(self._paused_event.wait())
+            try:
+                await asyncio.wait({all_done, paused}, timeout=WAIT_TIMEOUT_S,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for fut in (all_done, paused):
+                    if not fut.done():
+                        fut.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await fut
         self._set_status(requester, "working", "")
         return {t: (self.store.task(t) or {}) for t in task_ids}
 
@@ -372,10 +573,23 @@ class Office:
             except KeyError:
                 queue.task_done()
                 return                      # fired while this was queued
+            if task_id in self._cancelled:            # cancelled while queued
+                self._finish_cancelled(agent_id, task_id)
+                queue.task_done()
+                continue
+            job = asyncio.create_task(self._run_task(role, task_id),
+                                      name=f"job:{task_id}")
+            self._current[agent_id] = job
             try:
-                await self._run_task(role, task_id)
+                await job
             except asyncio.CancelledError:
-                raise
+                # Two very different cancellations arrive the same way: the
+                # office shutting this worker down, or a human cancelling
+                # one job. Only the second one is ours to absorb.
+                if asyncio.current_task().cancelling():
+                    raise
+                self._release_slot_if_held(agent_id)
+                self._finish_cancelled(agent_id, task_id)
             except Exception as exc:
                 log.exception("worker %s crashed on %s", agent_id, task_id)
                 self.store.update_task(task_id, status="failed", error=str(exc),
@@ -384,6 +598,7 @@ class Office:
                                  status="failed")
                 self._on_failure(agent_id, task_id, str(exc))
             finally:
+                self._current.pop(agent_id, None)
                 # Set, then forget. Anyone already awaiting holds their own
                 # reference; a later `wait` finds no event and reads the
                 # finished row directly. Keeping these grew without bound.
@@ -393,16 +608,34 @@ class Office:
                 self._set_status(agent_id, "idle", "")
                 queue.task_done()
 
+    def _settled_meanwhile(self, task_id):
+        """True when someone finished this row while the worker was parked -
+        a cancel during a pause, in practice."""
+        row = self.store.task(task_id)
+        return row is None or row["status"] not in ("queued", "running")
+
+    def _release_slot_if_held(self, agent_id):
+        # A job cancelled inside `async with self._model_slots` releases the
+        # slot on the way out; nothing to do. Kept as a named hook so the
+        # invariant has a place to live if _run_model ever changes.
+        return None
+
     async def _run_task(self, role, task_id):
         task = self.store.task(task_id)
-        if task is None:
+        if task is None or task["status"] not in ("queued", "running"):
             return
-        blocked = self._budget_block()
-        if blocked:
-            self.store.update_task(task_id, status="failed", error=blocked,
-                                   finished_at=time.time())
-            self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
-                             status="failed")
+        # A budget ceiling or a rate limit pauses the office; the task waits
+        # here, still queued, and runs when the pause lifts. It used to be
+        # marked failed on the spot, which turned a spending cap into a row of
+        # people summoned to the manager's office.
+        while True:
+            await self._await_resume(role.id, self._paused_reason)
+            blocked = self._budget_block()
+            if not blocked:
+                break
+            if not self._paused_reason:
+                self.pause(blocked, self._budget_resume_at())
+        if task_id in self._cancelled or self._settled_meanwhile(task_id):
             return
 
         self.store.update_task(task_id, status="running", started_at=time.time())
@@ -426,8 +659,23 @@ class Office:
             budget_usd=config.TASK_BUDGET_USD,
             cwd=str(config.WORKSPACE),
         )
-        turn = await self._run_model(request, ctx)
-        self._record_usage(role, turn)
+        while True:
+            turn = await self._run_model(request, ctx)
+            self._record_usage(role, turn, task_id)
+            if turn.stop != "rate_limited":
+                break
+            # The backend said no, not the employee. Park the office, keep
+            # the task, and try again when the window reopens.
+            self._pause_for_rate_limit(turn)
+            self.store.update_task(task_id, status="queued")
+            self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
+                             status="queued")
+            await self._await_resume(role.id, self._paused_reason)
+            if task_id in self._cancelled or self._settled_meanwhile(task_id):
+                return
+            self.store.update_task(task_id, status="running", started_at=time.time())
+            self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
+                             status="running")
 
         result = ctx.result or turn.text or "(no output)"
         # Three outcomes, not two. `finish` was called: done, whatever the
@@ -463,6 +711,7 @@ class Office:
         while True:
             text = await queue.get()
             try:
+                await self._await_resume(role.id, self._paused_reason)
                 await self._run_manager(role, text)
             except asyncio.CancelledError:
                 raise
@@ -476,7 +725,9 @@ class Office:
     async def _run_manager(self, role, text):
         blocked = self._budget_block()
         if blocked:
-            self._say_to_user(blocked)
+            if not self._paused_reason:
+                self.pause(blocked, self._budget_resume_at())
+            self._say_to_user(f"I can't start on that yet: {blocked}")
             return
         self._set_status(role.id, "thinking", "reading your request")
         ctx = AgentContext(self, role.id, None, "inbox")
@@ -484,7 +735,7 @@ class Office:
             agent_id=role.id,
             system=(config.fill(role.persona, self.principal())
                     + notebook.lesson_block(self.store, role.id)),
-            prompt=text,
+            prompt=self._memory_block(text) + text,
             tools=tools.specs_for(role),
             native_tools=role.native_tools,
             skills=role.skills,
@@ -496,6 +747,14 @@ class Office:
         )
         turn = await self._run_model(request, ctx)
         self._record_usage(role, turn)
+        if turn.stop == "rate_limited":
+            self._pause_for_rate_limit(turn)
+            self._say_to_user("The model is rate-limited right now, so the office is "
+                              f"paused. I'll pick this up again about "
+                              f"{time.strftime('%H:%M', time.localtime(self._paused_until))}.")
+            # Put it back: the manager loop parks on resume before the next one.
+            self.queues[config.MANAGER_ID].put_nowait(text)
+            return
         # message_user is the manager's proper exit; fall back to raw text so a
         # reply is never silently swallowed - and a reply cut short says so,
         # rather than reading as a complete answer that happens to end oddly.
@@ -510,6 +769,46 @@ class Office:
                 self._say_to_user(text)
 
     # -- helpers ---------------------------------------------------------
+    def _memory_block(self, current_text):
+        """The last few exchanges, clipped, so a follow-up has something to
+        follow. Goes in the user turn, not the system prompt, so the cached
+        prefix stays byte-identical across requests."""
+        n = config.MANAGER_MEMORY
+        if not n:
+            return ""
+        rows = self.store.messages(limit=n * 2 + 1)
+        # The message being handled was stored before this runs; drop it.
+        if rows and rows[-1]["sender"] == "user" and rows[-1]["body"] == current_text:
+            rows = rows[:-1]
+        rows = [r for r in rows if r["sender"] in ("user", config.MANAGER_ID)][-(n * 2):]
+        if not rows:
+            return ""
+        lines = []
+        for r in rows:
+            who = "You" if r["sender"] == "user" else "Miles"
+            lines.append(f"{who}: {llm.truncate(' '.join(r['body'].split()), 220)}")
+        return ("Recent conversation, oldest first, for context only - the new "
+                "message is at the end:\n" + "\n".join(lines) + "\n\nNew message:\n")
+
+    def _pause_for_rate_limit(self, turn):
+        wait = turn.retry_after or config.RATE_LIMIT_PAUSE_S
+        resume_at = time.time() + wait
+        log.warning("rate limited by the backend (%s); pausing %ds",
+                    (turn.error or "")[:200], wait)
+        self.pause("the model reported a rate limit", resume_at)
+
+    def _budget_resume_at(self):
+        """When a budget block lifts on its own: the oldest row in the window
+        ages out. Daily budget: 24h from the first spend; token ceiling: the
+        session window from its first turn."""
+        now = time.time()
+        if config.SESSION_TOKEN_BUDGET:
+            since = now - config.SESSION_WINDOW_S
+            if self.store.usage_totals(since)["tokens"] >= config.SESSION_TOKEN_BUDGET:
+                return (self.store.usage_first_ts(since) or now) + config.SESSION_WINDOW_S
+        first = self.store.usage_first_ts(now - 86400) or now
+        return first + 86400
+
     def _say_to_user(self, text):
         self.store.add_message(config.MANAGER_ID, "user", text)
         self.bus.publish("agent.message_user", agent_id=config.MANAGER_ID, text=text)
@@ -525,8 +824,8 @@ class Office:
         the telling-off must never delay or block real work."""
         asyncio.create_task(self.social.on_task_failed(agent_id, task_id, error))
 
-    def _record_usage(self, role, turn):
-        self.store.add_usage_row(role.id, role.model_id, turn)
+    def _record_usage(self, role, turn, task_id=None):
+        self.store.add_usage_row(role.id, role.model_id, turn, task_id)
         # The topbar renders the rolling window and the day, so publish those.
         # Publishing only the all-time figure left the display frozen at
         # whatever it was when the page loaded.
@@ -562,7 +861,6 @@ class Office:
             reason = (f"Daily budget reached (${spent:.2f} of "
                       f"${config.DAILY_BUDGET_USD:.2f} in the last 24h). "
                       "The office is paused. Raise OFFICE_DAILY_BUDGET_USD or wait.")
-            self.bus.publish("office.budget", reason=reason, spend=spent)
             return reason
         # On a subscription the dollar figure is notional; tokens per window
         # are what the plan actually meters. This is the ceiling that counts.
@@ -576,8 +874,6 @@ class Office:
                           f"{config.SESSION_TOKEN_BUDGET:,} in the last "
                           f"{config.SESSION_WINDOW_S // 3600}h. Paused until about "
                           f"{time.strftime('%H:%M', time.localtime(resume))}.")
-                self.bus.publish("office.budget", reason=reason, tokens=used,
-                                 resume_at=resume)
                 return reason
         return ""
 
@@ -586,18 +882,30 @@ class Office:
         """Fires due reminders and, once a day, prunes old rows. Never calls a
         model: an idle office costs nothing."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             try:
-                for row in self.store.due_reminders():
-                    self.store.mark_reminder_fired(row["id"])
-                    self._say_to_user(f"⏰ Reminder: {row['text']}")
-                if time.time() - self._last_prune > 86400:
-                    self._last_prune = time.time()
-                    removed = self.store.prune(config.RETENTION_DAYS)
-                    if any(removed.values()):
-                        log.info("pruned %s", removed)
+                self._tick()
             except Exception:
                 log.exception("ticker failed")
+
+    def _tick(self):
+        """One pass of the ticker. A timed pause lifts itself here; a budget
+        pause re-checks the ledger first and pushes its own deadline out if
+        the window has not actually cleared."""
+        if self._paused_reason and self._paused_until \
+                and time.time() >= self._paused_until:
+            if self._budget_block() and "rate limit" not in self._paused_reason:
+                self._paused_until = self._budget_resume_at()
+            else:
+                self.resume()
+        for row in self.store.due_reminders():
+            self.store.mark_reminder_fired(row["id"])
+            self._say_to_user(f"⏰ Reminder: {row['text']}")
+        if time.time() - self._last_prune > 86400:
+            self._last_prune = time.time()
+            removed = self.store.prune(config.RETENTION_DAYS)
+            if any(removed.values()):
+                log.info("pruned %s", removed)
 
 
 class Verdict(str):
