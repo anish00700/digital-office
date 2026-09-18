@@ -235,6 +235,28 @@ async def _message_user(args, ctx):
     return "delivered"
 
 
+async def _ask_colleague(args, ctx):
+    """One short question to one colleague, answered inline. The colleague
+    gets a small read-only task; the asker waits, then carries on."""
+    colleague = (args.get("employee") or "").strip().lower()
+    question = " ".join((args.get("question") or "").split())
+    if not question:
+        return "ask an actual question"
+    if colleague == ctx.agent_id:
+        return "that is you. Ask someone else, or answer it yourself"
+    if colleague == config.MANAGER_ID:
+        return "Miles is not a colleague to consult - finish with what you need and he decides"
+    if colleague not in config.STAFF_IDS:
+        others = [i for i in config.STAFF_IDS if i != ctx.agent_id]
+        return f"no such colleague {colleague!r}. Staff: {', '.join(others)}"
+    if ctx.origin == "peer":
+        return "you are answering a colleague's question; answer from what you know"
+    if ctx.peer_count >= config.PEER_QUESTIONS_PER_TASK:
+        return (f"you have asked {ctx.peer_count} colleague question(s) on this task, "
+                "the most allowed. Finish with what you have and say what is missing.")
+    return await ctx.office.ask_colleague(ctx, colleague, question[:600])
+
+
 async def _add_routine(args, ctx):
     """Recurring work is recurring spend, so it is approval-gated."""
     title = (args.get("title") or "").strip()[:80]
@@ -442,6 +464,12 @@ _SPECS = {
     "message_user": ToolSpec(
         "message_user", "Send your principal a message. This is your final answer.",
         {"text": str}, _message_user, read_only=False),
+    "ask_colleague": ToolSpec(
+        "ask_colleague",
+        "Ask one colleague a short question they can answer from their own "
+        "domain or their recent work; the answer comes back here. Not for "
+        "handing off work or widening scope - that goes to Miles via finish.",
+        {"employee": str, "question": str}, _ask_colleague),
     "add_routine": ToolSpec(
         "add_routine",
         "Schedule recurring work for one employee. schedule: 'daily HH:MM', "
@@ -481,8 +509,13 @@ _SPECS = {
 }
 
 
-def specs_for(role):
-    return [_SPECS[n] for n in role.office_tools if n in _SPECS]
+def specs_for(role, peer=False):
+    """A colleague answering a question gets the same tools minus the one
+    that would let them ask a colleague of their own: depth one, always."""
+    names = [n for n in role.office_tools if n in _SPECS]
+    if peer:
+        names = [n for n in names if n != "ask_colleague"]
+    return [_SPECS[n] for n in names]
 
 
 def tool_names():

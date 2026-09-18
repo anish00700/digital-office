@@ -31,8 +31,11 @@ class AgentContext:
         self.task_id = task_id
         self.task_title = task_title
         self.result = ""
-        self.origin = "user"       # user | manager | routine | review
+        self.origin = "user"       # user | manager | routine | review | peer
         self.needs_you = ""        # the action that expired unanswered, if any
+        self.parent_task_id = None # for a peer answer: the task that asked
+        self.peer_count = 0        # colleague questions asked on this task
+        self.peer_log = []         # "asked Cal: q -> a", for the result block
 
     # -- output --------------------------------------------------------
     def emit(self, kind, **payload):
@@ -138,7 +141,7 @@ class Office:
                 self.bus.publish("task.updated", agent_id=row["assignee"],
                                  task_id=row["id"], status="queued")
             self._task_events[row["id"]] = asyncio.Event()
-            self.queues[row["assignee"]].put_nowait(row["id"])
+            self._enqueue(row["assignee"], row["id"])
             requeued.append(row["title"])
         if requeued or dropped:
             self.bus.publish("office.recovered", requeued=len(requeued), dropped=dropped)
@@ -219,7 +222,7 @@ class Office:
             self.store.update_task(task_id, status="queued", result=None, error=None,
                                    stop=None, started_at=None, finished_at=None)
             self._task_events[task_id] = asyncio.Event()
-            self.queues[row["assignee"]].put_nowait(task_id)
+            self._enqueue(row["assignee"], task_id)
             self.bus.publish("task.updated", agent_id=row["assignee"], task_id=task_id,
                              status="queued", title=row["title"])
             if row["created_by"] in ("user",) or row["created_by"].startswith("routine:"):
@@ -263,6 +266,53 @@ class Office:
         if verdict.upper().startswith("APPROVED"):
             return text + f"\n\n(checked by {name})"
         return verdict + f"\n\n(corrected by {name}; the original was withheld)"
+
+    # -- colleagues -------------------------------------------------------------
+    async def ask_colleague(self, ctx, colleague, question):
+        """Post the question as a small priority task on the colleague's
+        queue, walk over on the floor, wait a bounded time, come back with
+        the answer. The asker's own model call stays open throughout - which
+        is why peer answers bypass the model-slot semaphore, or three askers
+        would hold every slot and wait on each other."""
+        asker = config.role(ctx.agent_id)
+        who = config.role(colleague)
+        ctx.peer_count += 1
+        title = f"Q from {asker.name}: {question[:50]}"
+        brief = (f"A colleague, {asker.name} ({asker.title}), is working on "
+                 f"'{ctx.task_title or 'a task'}' and asks you:\n\n{question}\n\n"
+                 "Answer from what you know or can read, in under 120 words. If you "
+                 "cannot answer without running commands or changing anything, say so "
+                 "and stop - do not do their work.")
+        task_id = await self.assign(colleague, title, brief,
+                                    created_by=f"peer:{ctx.task_id or 'none'}:{ctx.agent_id}",
+                                    priority=0)
+        self.bus.publish("social.visit", agent_id=ctx.agent_id, task_id=ctx.task_id,
+                         to=colleague, question=question[:160])
+        self._set_status(ctx.agent_id, "waiting", f"asking {who.name}", ctx.task_id)
+        event = self._task_events.get(task_id)
+        answered = False
+        try:
+            if event is not None:
+                await asyncio.wait_for(event.wait(), config.PEER_TIMEOUT_S)
+                answered = True
+        except asyncio.TimeoutError:
+            self.cancel_task(task_id)
+        finally:
+            self.bus.publish("social.visit_end", agent_id=ctx.agent_id, to=colleague,
+                             answered=answered)
+            self._set_status(ctx.agent_id, "working", (ctx.task_title or "")[:60],
+                             ctx.task_id)
+        row = self.store.task(task_id) or {}
+        if not answered or row.get("status") != "done":
+            reason = ("no answer within "
+                      f"{config.PEER_TIMEOUT_S // 60} minutes" if not answered
+                      else f"could not answer ({row.get('status')})")
+            ctx.peer_log.append(f"asked {who.name}: {question[:60]} -> {reason}")
+            return (f"{who.name} could not answer in time ({reason}). Carry on without "
+                    "it and say so in your result.")
+        answer = (row.get("result") or "").strip()
+        ctx.peer_log.append(f"asked {who.name}: {question[:60]} -> {answer[:160]}")
+        return f"{who.name} says:\n{llm.truncate(answer, 1200)}"
 
     # -- routines -------------------------------------------------------------
     def add_routine(self, title, assignee, brief, schedule, created_by="user"):
@@ -529,12 +579,22 @@ class Office:
         """One-line description per office tool, for the staff panel."""
         return tools.describe_tools()
 
+    # Worker queues are priority queues: (priority, seq, task_id). Normal work
+    # is 1; a colleague's question is 0, so it is answered ahead of queued
+    # backlog while the asker waits - but never interrupts a running job.
+    _seq = 0
+
+    def _enqueue(self, agent_id, task_id, priority=1):
+        Office._seq += 1
+        self.queues.setdefault(agent_id, asyncio.PriorityQueue()).put_nowait(
+            (priority, Office._seq, task_id))
+
     def _spawn_worker(self, agent_id):
         """On the office loop. Idempotent."""
         existing = self._staff_tasks.get(agent_id)
         if existing is not None and not existing.done():
             return
-        self.queues.setdefault(agent_id, asyncio.Queue())
+        self.queues.setdefault(agent_id, asyncio.PriorityQueue())
         self._staff_tasks[agent_id] = asyncio.create_task(
             self._worker_loop(agent_id), name=f"worker:{agent_id}")
 
@@ -684,7 +744,7 @@ class Office:
         return row
 
     # -- delegation ------------------------------------------------------
-    async def assign(self, assignee, title, brief, created_by):
+    async def assign(self, assignee, title, brief, created_by, priority=1):
         # Fail loudly rather than queueing for someone who does not work here:
         # an unclaimed queue has no worker, so the task would sit until the
         # requester's 15-minute wait expired with nothing to show for it.
@@ -696,8 +756,8 @@ class Office:
                          title=title, assignee=assignee, created_by=created_by)
         self.bus.publish("handoff", agent_id=created_by, task_id=task_id,
                          to=assignee)
-        # setdefault: a brand-new hire's worker may not have spawned yet.
-        await self.queues.setdefault(assignee, asyncio.Queue()).put(task_id)
+        # setdefault (inside _enqueue): a new hire's worker may not have spawned yet.
+        self._enqueue(assignee, task_id, priority)
         return task_id
 
     async def wait_for(self, task_ids, requester):
@@ -772,7 +832,7 @@ class Office:
     async def _worker_loop(self, agent_id):
         queue = self.queues[agent_id]
         while True:
-            task_id = await queue.get()
+            _priority, _seq, task_id = await queue.get()
             try:
                 # Re-read every time: the staff panel may have changed this
                 # employee's model, tools or persona since the last task.
@@ -853,23 +913,32 @@ class Office:
 
         ctx = AgentContext(self, role.id, task_id, task["title"])
         ctx.origin = _origin_of(task["created_by"])
+        peer = ctx.origin == "peer"
+        if peer:
+            # peer:<parent task>:<asker>
+            ctx.parent_task_id = task["created_by"].split(":")[1]
+        # A colleague answering a question: fewer turns, cheapest effort, and
+        # only tools that read. Nobody runs commands on somebody else's behalf.
         request = llm.RunRequest(
             agent_id=role.id,
             system=(config.fill(role.persona, self.principal())
                     + notebook.lesson_block(self.store, role.id)),
             prompt=task["brief"],
-            tools=tools.specs_for(role),
-            native_tools=role.native_tools,
-            skills=role.skills,
+            tools=tools.specs_for(role, peer=peer),
+            native_tools=(tuple(t for t in role.native_tools
+                                if t in ("Read", "Grep", "Glob", "WebSearch", "WebFetch"))
+                          if peer else role.native_tools),
+            skills=() if peer else role.skills,
             model=role.model_id,
-            effort=role.effort,
-            max_turns=role.max_turns,
-            budget_usd=config.TASK_BUDGET_USD,
+            effort="low" if peer else role.effort,
+            max_turns=min(role.max_turns, config.PEER_MAX_TURNS) if peer else role.max_turns,
+            budget_usd=config.TASK_BUDGET_USD / 2 if peer else config.TASK_BUDGET_USD,
             cwd=str(config.WORKSPACE),
         )
         while True:
             turn = await self._run_model(request, ctx)
-            self._record_usage(role, turn, task_id)
+            # A colleague's answer is spent on the task that asked for it.
+            self._record_usage(role, turn, ctx.parent_task_id or task_id)
             if turn.stop != "rate_limited":
                 break
             # The backend said no, not the employee. Park the office, keep
@@ -886,6 +955,10 @@ class Office:
                              status="running")
 
         result = ctx.result or turn.text or "(no output)"
+        if ctx.peer_log:
+            # Miles reads results, not transcripts: who was consulted, and
+            # what they said, has to be in the result to be seen at all.
+            result += "\n\n(consulted: " + "; ".join(ctx.peer_log) + ")"
         # Three outcomes, not two. `finish` was called: done, whatever the
         # stop reason - the agent said it was finished. Otherwise a run cut
         # off by max_turns or the budget is *partial*: the office's cap did
@@ -1059,6 +1132,12 @@ class Office:
         """Every model call passes through one semaphore. On a subscription the
         limits are sized for one person typing; nine agents starting at once is
         how you meet the 5-hour window at 9:04am."""
+        if ctx.origin in ("peer", "review"):
+            # Somebody is holding a slot while they wait for this answer.
+            # Making it queue for a slot too is how three askers deadlock.
+            self._set_status(ctx.agent_id, "working", (ctx.task_title or "")[:60],
+                             ctx.task_id)
+            return await self.backend.run(request, ctx, ctx.emit)
         if self._model_slots.locked():
             self._set_status(ctx.agent_id, "queued", "waiting for a free model slot",
                              ctx.task_id)
@@ -1128,6 +1207,8 @@ def _origin_of(created_by):
     created_by = created_by or "user"
     if created_by.startswith("routine:"):
         return "routine"
+    if created_by.startswith("peer:"):
+        return "peer"
     if created_by in ("user", "manager", "review"):
         return created_by
     return "manager"                     # any other employee id

@@ -125,6 +125,13 @@ REVIEWER_ID = os.environ.get("OFFICE_REVIEWER", "critic").strip() or "critic"
 # the URL (which may embed a token) never enters the process environment.
 NOTIFY_URL = (vault.secret("OFFICE_NOTIFY_URL", "") or "").strip()
 NOTIFY_TOKEN = (vault.secret("OFFICE_NOTIFY_TOKEN", "") or "").strip()
+# Employees may ask one colleague a short question mid-task. Bounded on every
+# axis: questions per task, turns the answer may take, seconds to wait. A
+# colleague answering never runs commands or writes anything, and cannot ask
+# a colleague of their own - depth one, always.
+PEER_QUESTIONS_PER_TASK = max(0, int(os.environ.get("OFFICE_PEER_QUESTIONS", "3")))
+PEER_MAX_TURNS = max(1, int(os.environ.get("OFFICE_PEER_MAX_TURNS", "3")))
+PEER_TIMEOUT_S = max(20, int(os.environ.get("OFFICE_PEER_TIMEOUT", "120")))
 
 # -- who this office works for ---------------------------------------------
 # Personas write {principal} rather than naming a profession, and it is
@@ -309,7 +316,7 @@ class Role:
 
 # Every worker gets these. Kept deliberately short: each tool definition is
 # re-sent on every request, so the tool surface is a recurring token cost.
-_WORKER_TOOLS = ("note", "ask_human", "finish", "read_context", "learn")
+_WORKER_TOOLS = ("note", "ask_human", "finish", "read_context", "learn", "ask_colleague")
 
 _ROLE_LIST = (
     Role(

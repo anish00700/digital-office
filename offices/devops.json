@@ -1,6 +1,6 @@
 {
   "format": "digital-office/1",
-  "exported_at": "2026-09-18T11:51:50+0530",
+  "exported_at": "2026-09-18T12:05:34+0530",
   "principal": "one person: your principal, a DevOps engineer. Assume deep technical fluency and skip basic infrastructure explanation",
   "pack": "devops",
   "staff": [
@@ -59,6 +59,7 @@
         "finish",
         "read_context",
         "learn",
+        "ask_colleague",
         "list_staff",
         "list_skills",
         "hire_employee"
@@ -88,7 +89,8 @@
         "ask_human",
         "finish",
         "read_context",
-        "learn"
+        "learn",
+        "ask_colleague"
       ],
       "native_tools": [
         "Bash",
@@ -120,7 +122,8 @@
         "ask_human",
         "finish",
         "read_context",
-        "learn"
+        "learn",
+        "ask_colleague"
       ],
       "native_tools": [
         "Bash",
@@ -153,6 +156,7 @@
         "finish",
         "read_context",
         "learn",
+        "ask_colleague",
         "fetch_slack",
         "fetch_mail"
       ],
@@ -181,7 +185,8 @@
         "ask_human",
         "finish",
         "read_context",
-        "learn"
+        "learn",
+        "ask_colleague"
       ],
       "native_tools": [
         "WebSearch",
@@ -212,6 +217,7 @@
         "finish",
         "read_context",
         "learn",
+        "ask_colleague",
         "now",
         "add_reminder",
         "list_reminders"
@@ -244,7 +250,8 @@
         "ask_human",
         "finish",
         "read_context",
-        "learn"
+        "learn",
+        "ask_colleague"
       ],
       "native_tools": [
         "Read",
@@ -274,7 +281,8 @@
         "ask_human",
         "finish",
         "read_context",
-        "learn"
+        "learn",
+        "ask_colleague"
       ],
       "native_tools": [
         "Bash",

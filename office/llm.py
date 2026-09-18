@@ -661,6 +661,16 @@ class MockBackend:
             if names:
                 on_event("tool", tool=random.choice(names), args="")
                 await asyncio.sleep(random.uniform(0.4, 1.0))
+            # Now and then, check something with a colleague - so the demo
+            # shows the walk over, the answer, and the note in the result.
+            specs = {s.name: s for s in req.tools}
+            others = [i for i in config.STAFF_IDS if i != req.agent_id]
+            if "ask_colleague" in specs and others and random.random() < 0.3:
+                who = random.choice(others)
+                on_event("tool", tool="ask_colleague", args=who)
+                await specs["ask_colleague"].handler(
+                    {"employee": who, "question": "Anything I should know before "
+                     f"I finish '{truncate(req.prompt, 40)}'?"}, ctx)
             if random.random() < self.FAILURE_RATE:
                 excuse = random.choice(self.EXCUSES)
                 if excuse.startswith("ran out of turns"):

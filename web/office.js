@@ -244,7 +244,7 @@ function handle(ev) {
         sp.state = p.status;
         // Work arrives - stop whatever social thing you were doing.
         if (p.status === 'working' && sp.activity !== 'desk' &&
-            sp.activity !== 'scolded') sendHome(sp);
+            sp.activity !== 'scolded' && sp.activity !== 'visit') sendHome(sp);
       }
       break;
 
@@ -308,6 +308,27 @@ function handle(ev) {
       if (sp) { say(ev.agent_id, p.line); sendHome(sp); }
       pushFeed(ev); break;
 
+    // A colleague question: walk over to their desk, ask, wait there for
+    // the answer, walk back. Zero tokens; the daemon only says who and what.
+    case 'social.visit': {
+      const host = V.sprites[p.to];
+      if (!sp || !host || sp.activity === 'scolded') { pushFeed(ev); break; }
+      const spot = standNear(sp, host);
+      if (spot) {
+        sp.activity = 'visit';
+        sp.script = [{ type: 'goto', x: spot.x, y: spot.y },
+                     { type: 'face', dir: spot.x > host.home.x ? 'left' : 'right' },
+                     { type: 'say', text: p.question || '...' }];
+      }
+      pushFeed(ev); break;
+    }
+    case 'social.visit_end':
+      if (sp && sp.activity === 'visit') {
+        if (p.answered) { const h = V.sprites[p.to]; if (h) say(p.to, 'Here you go.'); }
+        sendHome(sp);
+      }
+      pushFeed(ev); break;
+
     case 'social.summoned':
       if (!sp) break;
       sp.activity = 'scolded';
@@ -357,6 +378,17 @@ function say(agentId, text) {
   const sp = V.sprites[agentId];
   if (!sp || !text) return;
   sp.bubble = { text, until: V.t + Math.min(14, 3.2 + String(text).length / 22) };
+}
+
+/** A free tile beside somebody's seat, reachable from where `sp` stands. */
+function standNear(sp, host) {
+  const h = host.home;
+  const candidates = [{ x: h.x + 1, y: h.y }, { x: h.x - 1, y: h.y },
+                      { x: h.x, y: h.y + 1 }, { x: h.x + 1, y: h.y + 1 }];
+  for (const c of candidates) {
+    if (findPath(sp.x, sp.y, c.x, c.y).length) return c;
+  }
+  return null;
 }
 
 function sendHome(sp) {
@@ -3391,6 +3423,8 @@ function appendLine(feed, ev) {
   }
   else if (kind === 'resumed') { who = { name: 'office', emoji: '▶' }; text = 'resumed'; cls = 'social'; }
   else if (kind === 'careful') { who = { name: 'office', emoji: '🛡' }; text = `careful mode ${p.on ? 'on' : 'off'}`; cls = 'social'; }
+  else if (kind === 'visit') { text = `asks ${(S.byId[p.to] || {}).name || p.to}: "${p.question || ''}"`; cls = 'social'; }
+  else if (kind === 'visit_end') { text = p.answered ? `back at their desk with ${(S.byId[p.to] || {}).name || p.to}'s answer` : `gave up waiting on ${(S.byId[p.to] || {}).name || p.to}`; cls = 'social'; }
   else if (kind === 'feedback') { text = `${p.feedback === 'up' ? '👍' : '👎'}${p.note ? ' — "' + p.note + '"' : ''}${p.learned ? ' (noted)' : ''}`; cls = 'social'; }
   else if (kind === 'fired') { text = `routine "${p.title}" ${p.manual ? 'run by you' : 'fired'}`; cls = 'tool'; }
   else if (kind === 'changed' && ev.type === 'routine.changed') { who = { name: 'office', emoji: '🔁' }; text = `routine ${p.action}${p.title ? ': ' + p.title : ''}`; cls = 'social'; }

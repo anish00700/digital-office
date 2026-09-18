@@ -184,6 +184,16 @@ def _refresh_default_persona(db, role_id):
         db.execute("UPDATE roster SET persona=? WHERE id=?", (role.persona, role_id))
 
 
+def _add_tool_to_workers(db, tool):
+    for row in db.execute("SELECT id, office_tools FROM roster WHERE active=1").fetchall():
+        try:
+            tools = list(json.loads(row["office_tools"] or "[]"))
+        except (TypeError, ValueError):
+            continue
+        if "finish" in tools and tool not in tools:
+            _add_tool(db, row["id"], tool)
+
+
 def _add_tool(db, role_id, tool):
     """Grant one office tool to one roster row if it lacks it. Migration
     helper; safe to run twice."""
@@ -242,6 +252,10 @@ class Store:
         # in. Only rows still carrying the shipped text are touched; an edited
         # persona is the owner's and stays theirs.
         ("roster.comms_untrusted_tag", lambda db: _refresh_default_persona(db, "comms")),
+        # Every worker may now ask a colleague. Workers are the rows that can
+        # `finish`; the manager delegates instead and is left alone.
+        ("roster.workers_ask_colleague",
+         lambda db: _add_tool_to_workers(db, "ask_colleague")),
     )
 
     def _migrate(self):

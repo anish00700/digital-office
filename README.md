@@ -364,6 +364,18 @@ default; the ones that cost money are marked `BUDGET` in the source.
   `kubectl rollout`" on an approval card records binary + subcommand, never a bare
   binary; a deny you add beats every allow, including the shipped list.
 
+**Employees can check with each other**
+- Any worker can `ask_colleague` one short question mid-task: it becomes a small
+  priority task on the colleague's queue, the asker walks over on the floor and
+  waits, and the answer comes back inline. Bounded on every axis: three questions
+  per task (`OFFICE_PEER_QUESTIONS`), three turns for the answer, two minutes to
+  wait (`OFFICE_PEER_TIMEOUT`), read-only tools only for the one answering, and
+  depth one - a colleague answering cannot ask onward. A question that times out
+  is cancelled, not left running.
+- Miles sees every exchange: the result carries `(consulted: asked Cal: … -> …)`,
+  and both sides' spend is attributed to the task that asked. Answering never
+  waits for a model slot, so askers holding slots cannot deadlock on each other.
+
 **Spend is bounded**
 - `OFFICE_TASK_BUDGET_USD` (default $0.15) is enforced by the SDK per task.
 - `OFFICE_DAILY_BUDGET_USD` (default $2.00) pauses the entire office for a rolling
