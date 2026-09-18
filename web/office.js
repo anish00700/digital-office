@@ -154,6 +154,8 @@ async function loadState() {
   S.paused = state.paused || '';
   S.pausedUntil = state.paused_until || 0;
   S.frontDesk = !!state.front_desk;
+  S.careful = !!state.careful_mode;
+  S.reviewer = state.reviewer || '';
   S.startedAt = state.started_at;
   S.seq = state.seq;
 
@@ -195,7 +197,7 @@ async function loadState() {
   $('backendStat').title = 'Backend: ' + state.backend + ' - auth: ' + state.auth;
   renderRecipients();
   renderBoard(); renderApprovals(); renderSpend(); renderFeed(); renderPaused();
-  composerHint();
+  composerHint(); renderCareful();
   S.principal = state.principal || '';
   if (state.setup_needed) openSetup();
 }
@@ -281,6 +283,11 @@ function handle(ev) {
     case 'office.resumed':
       S.paused = ''; S.pausedUntil = 0; renderPaused(); pushFeed(ev); break;
     case 'router.decided': pushFeed(ev); break;
+    case 'office.careful': S.careful = !!p.on; renderCareful(); pushFeed(ev); break;
+    case 'task.feedback': refreshTasks(); pushFeed(ev); break;
+    case 'routine.fired':
+    case 'routine.changed': if (STAFF.open) loadRoutines(); pushFeed(ev); break;
+    case 'lesson.changed': if (V.selected === ev.agent_id) showAgent(ev.agent_id); break;
 
     /* ---- the social life of the office ---- */
     case 'social.break': {
@@ -2022,6 +2029,12 @@ function wireUI() {
     });
   };
   $('resumeBtn').onclick = () => $('pauseBtn').onclick();
+  $('carefulBtn').onclick = async () => {
+    await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ careful_mode: !S.careful })
+    });
+  };
   $('staffBtn').onclick = openStaff;
   $('staffClose').onclick = closeStaff;
   $('staffExport').onclick = exportOffice;
@@ -2169,12 +2182,78 @@ function composerHint() {
   }
 }
 
-async function decide(id, approved, response) {
+async function decide(id, approved, response, alwaysAllow) {
   await fetch('/api/approval', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, approved, response })
+    body: JSON.stringify({ id, approved, response, always_allow: !!alwaysAllow })
   });
   refreshApprovals();
+}
+
+async function feedback(id, up, note) {
+  await fetch('/api/task/feedback', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, up, note: note || '' })
+  });
+  refreshTasks();
+}
+
+async function retryTask(id) {
+  await fetch('/api/task/retry', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  refreshTasks();
+}
+
+function renderCareful() {
+  const btn = $('carefulBtn');
+  if (!btn) return;
+  const can = !!S.reviewer;
+  btn.disabled = !can;
+  btn.classList.toggle('on', S.careful && can);
+  btn.classList.add('careful');
+  const who = (S.byId[S.reviewer] || {}).name || S.reviewer;
+  btn.textContent = S.careful && can ? `🛡 Careful · ${who}` : '🛡 Careful';
+  btn.title = can
+    ? `Careful mode: ${S.careful ? 'on' : 'off'}. Replies go past ${who} (red team) before you see them; one extra turn each.`
+    : 'Careful mode needs a reviewer on staff (the Red Team role, "critic"). Hire one under Staff.';
+}
+
+async function lessonPost(agent, action, extra) {
+  const r = await fetch('/api/lessons', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent, action, ...extra })
+  });
+  return r.json();
+}
+
+function renderLessons(id, lessons) {
+  const box = el('div', 'lessons');
+  box.innerHTML = `<h4>Notes they carry (${lessons.length}/6)</h4>`;
+  for (const l of lessons) {
+    const row = el('div', 'lesson');
+    const text = el('span', '', l.text);
+    const x = el('button', '', '✕');
+    x.title = 'Forget this note';
+    x.onclick = async () => { await lessonPost(id, 'forget', { lesson_id: l.id }); showAgent(id); };
+    row.append(text, x);
+    box.appendChild(row);
+  }
+  const add = el('div', 'lessonAdd');
+  const input = document.createElement('input');
+  input.placeholder = 'Teach them something (one line)…';
+  const go = el('button', '', 'Add');
+  go.onclick = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    const out = await lessonPost(id, 'add', { text });
+    if (out.error) alert(out.error); else showAgent(id);
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') go.click(); });
+  add.append(input, go);
+  box.appendChild(add);
+  return box;
 }
 
 /* -------------------------------------------------------------- panels -- */
@@ -2419,6 +2498,7 @@ function ago(ts) {
 
 function renderBoard() {
   const groups = [
+    ['Needs you', S.tasks.filter(t => t.status === 'needs_you')],
     ['In progress', S.tasks.filter(t => t.status === 'running')],
     ['Queued', S.tasks.filter(t => t.status === 'queued')],
     ['Finished', S.tasks.filter(t => ['done', 'partial', 'failed', 'cancelled'].includes(t.status)).slice(0, 14)],
@@ -2472,8 +2552,31 @@ function renderBoard() {
         x.title = 'Stop this task now';
         x.onclick = (e) => { e.stopPropagation(); cancelTask(t.id); };
         meta.appendChild(x);
+      } else {
+        // Your verdict teaches the employee: a note on a thumbs-down becomes
+        // one of their lessons, carried into every later task. Retry runs a
+        // stuck or failed task again in place.
+        const tools = el('div', 'cardTools');
+        const up = el('button', 'up' + (t.feedback === 'up' ? ' on' : ''), '👍');
+        up.title = 'Good work';
+        up.onclick = (e) => { e.stopPropagation(); feedback(t.id, true); };
+        const down = el('button', 'down' + (t.feedback === 'down' ? ' on' : ''), '👎');
+        down.title = 'Not good - tell them what to do differently';
+        down.onclick = (e) => {
+          e.stopPropagation();
+          const note = prompt(`What should ${(S.byId[t.assignee] || {}).name || 'they'} do differently next time? (one line; becomes a lesson)`);
+          if (note !== null) feedback(t.id, false, note);
+        };
+        tools.append(up, down);
+        if (t.status !== 'done' && t.status !== 'cancelled') {
+          const retry = el('button', 'retry', t.status === 'needs_you' ? 'Retry now' : 'Retry');
+          retry.onclick = (e) => { e.stopPropagation(); retryTask(t.id); };
+          tools.appendChild(retry);
+        }
+        card.appendChild(tools);
       }
-      const body = (t.status === 'failed' ? t.error : t.result) || t.brief || '';
+      const body = ((t.status === 'failed' || t.status === 'needs_you') ? t.error : t.result)
+        || t.brief || '';
       if (body) {
         const more = document.createElement('div');
         more.className = 'cardBody hidden';
@@ -2543,6 +2646,14 @@ function renderApprovals() {
     no.textContent = isQuestion ? 'Skip' : isHire ? 'Not this one' : 'Deny';
     no.onclick = () => decide(a.id, false, '');
     actions.append(yes, no);
+    if (a.kind === 'shell' && a.prefix) {
+      const always = document.createElement('button');
+      always.className = 'ghost always';
+      always.textContent = `Approve & always allow "${a.prefix}"`;
+      always.title = 'Adds this prefix to the auto-approved list (Staff → Safety)';
+      always.onclick = () => decide(a.id, true, '', true);
+      actions.appendChild(always);
+    }
     if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') yes.click(); });
     box.appendChild(el);
   }
@@ -2699,7 +2810,126 @@ async function applyRosterChange(ev) {
 async function openStaff() {
   STAFF.open = true;
   $('staffModal').classList.remove('hidden');
-  await loadRoster();
+  await Promise.all([loadRoster(), loadRoutines(), loadSafety()]);
+}
+
+async function loadRoutines() {
+  const d = await (await fetch('/api/routines')).json();
+  STAFF.routines = d.routines || [];
+  STAFF.routineHelp = d.help || '';
+  renderRoutines();
+}
+
+async function routinePost(body) {
+  const r = await fetch('/api/routines', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const d = await r.json();
+  if (d.error) { staffError(d.error); return null; }
+  staffError('');
+  STAFF.routines = d.routines || STAFF.routines;
+  renderRoutines();
+  return d;
+}
+
+function renderRoutines() {
+  const list = $('routinesList');
+  if (!list) return;
+  list.innerHTML = '';
+  for (const r of STAFF.routines || []) {
+    const row = el('div', 'rRow' + (r.enabled ? '' : ' off'));
+    const next = r.enabled && r.next_run
+      ? `next ${new Date(r.next_run * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}`
+      : 'off';
+    const last = r.last_run ? ` · last ${ago(r.last_run)} ago` : '';
+    const left = el('div');
+    left.innerHTML = `<b>${escapeHtml(r.title)}</b> <span class="rMeta">${r.assignee_emoji} ${escapeHtml(r.assignee_name)} · ${escapeHtml(r.schedule_text)} · ${next}${last}</span>`;
+    const tools = el('div', 'rTools');
+    const toggle = el('button', 'ghost', r.enabled ? 'Pause' : 'Enable');
+    toggle.onclick = () => routinePost({ action: 'update', id: r.id, enabled: !r.enabled });
+    const run = el('button', 'ghost', 'Run now');
+    run.onclick = () => routinePost({ action: 'run', id: r.id });
+    const del = el('button', 'sDanger', 'Remove');
+    del.onclick = () => { if (confirm(`Remove routine "${r.title}"?`)) routinePost({ action: 'delete', id: r.id }); };
+    tools.append(toggle, run, del);
+    row.append(left, tools);
+    list.appendChild(row);
+  }
+  if (!(STAFF.routines || []).length) list.innerHTML = '<p class="muted">No routines yet.</p>';
+
+  const form = $('routineAdd');
+  form.innerHTML = '';
+  const f = el('div', 'rForm');
+  const title = document.createElement('input'); title.placeholder = 'Title, e.g. Morning inbox sweep';
+  const schedule = document.createElement('input'); schedule.placeholder = STAFF.routineHelp || 'daily 08:00';
+  const who = document.createElement('select');
+  for (const r of (STAFF.roster || []).filter(r => !r.manager)) {
+    const o = document.createElement('option'); o.value = r.id; o.textContent = `${r.emoji} ${r.name} · ${r.title}`;
+    who.appendChild(o);
+  }
+  const brief = document.createElement('textarea');
+  brief.placeholder = 'The brief, written so it can run with nobody watching: what to check, what "done" looks like, what to report.';
+  const go = el('button', 'pill rSubmit', '+ Add routine');
+  go.onclick = async () => {
+    const d = await routinePost({ action: 'add', title: title.value, schedule: schedule.value,
+                                  assignee: who.value, brief: brief.value });
+    if (d) { title.value = ''; schedule.value = ''; brief.value = ''; }
+  };
+  f.append(title, schedule, who, el('div', 'rMeta', 'Runs in the office timezone; nothing fires while paused.'), brief, go);
+  form.appendChild(f);
+}
+
+async function loadSafety() {
+  STAFF.safety = await (await fetch('/api/safety')).json();
+  renderSafety();
+}
+
+async function safetyPost(body) {
+  const r = await fetch('/api/safety', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  STAFF.safety = await r.json();
+  renderSafety();
+}
+
+function renderSafety() {
+  const box = $('safetyBox');
+  if (!box || !STAFF.safety) return;
+  const s = STAFF.safety;
+  box.innerHTML = '';
+  const section = (label, items, kind) => {
+    box.appendChild(el('div', 'rMeta', label));
+    const list = el('div', 'safetyList');
+    for (const item of items) {
+      const tag = el('span', 'safetyTag' + (kind === 'deny' ? ' deny' : ''));
+      tag.appendChild(document.createTextNode(item));
+      const x = el('button', '', '✕');
+      x.title = 'Remove';
+      x.onclick = () => safetyPost({ [kind]: items.filter(i => i !== item) });
+      tag.appendChild(x);
+      list.appendChild(tag);
+    }
+    if (!items.length) list.appendChild(el('span', 'muted', 'none'));
+    box.appendChild(list);
+    const add = el('div', 'safetyAdd');
+    const input = document.createElement('input');
+    input.placeholder = kind === 'allow' ? 'e.g. kubectl rollout' : 'e.g. git push';
+    const go = el('button', 'ghost', kind === 'allow' ? 'Always allow' : 'Always ask');
+    go.onclick = () => { if (input.value.trim()) safetyPost({ [kind]: [...items, input.value.trim()] }); };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') go.click(); });
+    add.append(input, go);
+    box.appendChild(add);
+  };
+  section('Added by you - runs without asking', s.allow || [], 'allow');
+  section('Always ask, even if shipped as allowed', s.deny || [], 'deny');
+  const shipped = el('details');
+  shipped.innerHTML = `<summary class="rMeta">${(s.shipped || []).length} shipped read-only prefixes</summary>`;
+  const list = el('div', 'safetyList');
+  for (const item of s.shipped || []) list.appendChild(el('span', 'safetyTag', item));
+  shipped.appendChild(list);
+  box.appendChild(shipped);
 }
 
 function closeStaff() {
@@ -3123,6 +3353,7 @@ async function showAgent(id) {
   feed.innerHTML = '<p class="muted">loading…</p>';
   const data = await (await fetch('/api/agent/' + encodeURIComponent(id))).json();
   feed.innerHTML = '';
+  $('inspectorHead').appendChild(renderLessons(id, data.lessons || []));
   if (!data.transcript.length) feed.innerHTML = '<p class="muted">Nothing on the record yet.</p>';
   for (const row of data.transcript) {
     appendLine(feed, { type: 'agent.' + row.kind, agent_id: id, ts: row.ts,
@@ -3159,6 +3390,10 @@ function appendLine(feed, ev) {
     cls = 'error';
   }
   else if (kind === 'resumed') { who = { name: 'office', emoji: '▶' }; text = 'resumed'; cls = 'social'; }
+  else if (kind === 'careful') { who = { name: 'office', emoji: '🛡' }; text = `careful mode ${p.on ? 'on' : 'off'}`; cls = 'social'; }
+  else if (kind === 'feedback') { text = `${p.feedback === 'up' ? '👍' : '👎'}${p.note ? ' — "' + p.note + '"' : ''}${p.learned ? ' (noted)' : ''}`; cls = 'social'; }
+  else if (kind === 'fired') { text = `routine "${p.title}" ${p.manual ? 'run by you' : 'fired'}`; cls = 'tool'; }
+  else if (kind === 'changed' && ev.type === 'routine.changed') { who = { name: 'office', emoji: '🔁' }; text = `routine ${p.action}${p.title ? ': ' + p.title : ''}`; cls = 'social'; }
   else if (kind === 'decided' && ev.type === 'router.decided') {
     who = { name: 'front desk', emoji: '🛎️' };
     const tgt = S.byId[p.target] || {};

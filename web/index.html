@@ -23,6 +23,7 @@
   <button id="filesBtn" class="pill" title="Files your staff have written">📁 Files</button>
   <button id="staffBtn" class="pill" title="Hire, edit and let go of employees">👥 Staff</button>
   <button id="approvalsBtn" class="pill hidden">⚠ <span id="approvalsCount">0</span> waiting on you</button>
+  <button id="carefulBtn" class="pill ghostPill" title="Route replies past the red team before they reach you">🛡 Careful</button>
   <button id="pauseBtn" class="pill ghostPill" title="Stop starting new model calls; running work finishes">⏸ Pause</button>
 </header>
 <div id="pausedBanner" class="banner hidden">
@@ -146,6 +147,16 @@
     <div id="staffErr" class="staffErr hidden"></div>
     <div id="staffList"></div>
     <div id="staffHire"></div>
+    <h3 class="sSection">Routines</h3>
+    <p class="muted staffNote">Recurring work, sent straight to one employee on a
+      schedule. The result is posted to chat. Nothing runs unless you set it up.</p>
+    <div id="routinesList"></div>
+    <div id="routineAdd"></div>
+    <h3 class="sSection">Safety</h3>
+    <p class="muted staffNote">Shell commands that run without asking. Anything you
+      add here is trusted on every task; a deny beats every allow, including the
+      shipped list.</p>
+    <div id="safetyBox"></div>
   </div>
 </div>
 

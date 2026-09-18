@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import config, roster
+from . import config, roster, routines as routines_mod, tools
 
 log = logging.getLogger("office.http")
 
@@ -103,7 +103,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({
                 "id": agent_id,
                 "transcript": self.office.store.transcript(agent_id),
+                "lessons": self.office.store.lessons(agent_id),
             })
+        if route == "/api/routines":
+            return self._json({"routines": self._routines(), "help": routines_mod.HELP})
+        if route == "/api/safety":
+            return self._json(self.office.safety())
         if route == "/api/tasks":
             return self._json({"tasks": self.office.store.tasks()})
         if route == "/api/setup":
@@ -165,11 +170,59 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/approval":
             approval_id = body.get("id")
             approved = bool(body.get("approved"))
+            always = None
+            if approved and body.get("always_allow"):
+                pending = {a["id"]: a for a in self.office.store.pending_approvals()}
+                row = pending.get(approval_id)
+                if row and row["kind"] == "shell":
+                    always = self.office.always_allow(row["action"])
             row = self.office.decide_approval(
                 approval_id, approved, (body.get("response") or "").strip())
             if row is None:
                 return self._json({"error": "unknown or already decided"}, 404)
-            return self._json({"ok": True, "status": row["status"]})
+            return self._json({"ok": True, "status": row["status"], "always_allow": always})
+
+        if route == "/api/task/feedback":
+            out = self.office.set_feedback((body.get("id") or "").strip(),
+                                           bool(body.get("up")), body.get("note") or "")
+            if out is None:
+                return self._json({"error": "no such task, or it is still running"}, 404)
+            return self._json({"ok": True, **out})
+
+        if route == "/api/task/retry":
+            row = self.office.retry_task((body.get("id") or "").strip())
+            if row is None:
+                return self._json({"error": "only a finished task can be retried"}, 404)
+            return self._json({"ok": True, "id": row["id"]})
+
+        if route == "/api/lessons":
+            agent_id = (body.get("agent") or "").strip()
+            if agent_id not in config.STAFF_IDS and agent_id != config.MANAGER_ID:
+                return self._json({"error": "no such employee"}, 404)
+            if body.get("action") == "forget":
+                self.office.store.forget_lesson(agent_id, int(body.get("lesson_id") or 0))
+            elif body.get("action") == "add":
+                if not self.office.store.add_lesson(agent_id, body.get("text") or ""):
+                    return self._json({"error": "too short, or already known"}, 400)
+            else:
+                return self._json({"error": "action must be add or forget"}, 400)
+            self.office.bus.publish("lesson.changed", agent_id=agent_id)
+            return self._json({"ok": True, "lessons": self.office.store.lessons(agent_id)})
+
+        if route == "/api/settings":
+            if "careful_mode" in body:
+                on = self.office.set_careful_mode(bool(body.get("careful_mode")))
+                return self._json({"ok": True, "careful_mode": on,
+                                   "reviewer": config.REVIEWER_ID
+                                   if config.REVIEWER_ID in config.STAFF_IDS else None})
+            return self._json({"error": "nothing to set"}, 400)
+
+        if route == "/api/routines":
+            return self._routine_write(body)
+
+        if route == "/api/safety":
+            out = self.office.set_safety(body.get("allow"), body.get("deny"))
+            return self._json({"ok": True, **out})
 
         if route == "/api/setup":
             try:
@@ -198,6 +251,47 @@ class Handler(BaseHTTPRequestHandler):
             return self._roster_write(route.rsplit("/", 1)[-1], body)
 
         return self._send(404, "not found", "text/plain")
+
+    def _routines(self):
+        out = []
+        by_id = {r.id: r for r in config.ROSTER}
+        for r in self.office.store.routines():
+            row = dict(r)
+            try:
+                row["schedule_text"] = routines_mod.describe(r["schedule"])
+            except ValueError:
+                row["schedule_text"] = r["schedule"]
+            who = by_id.get(r["assignee"])
+            row["assignee_name"] = who.name if who else r["assignee"]
+            row["assignee_emoji"] = who.emoji if who else "👤"
+            out.append(row)
+        return out
+
+    def _routine_write(self, body):
+        action = (body.get("action") or "").strip()
+        try:
+            if action == "add":
+                rid = self.office.add_routine(
+                    (body.get("title") or "").strip(), (body.get("assignee") or "").strip(),
+                    (body.get("brief") or "").strip(), body.get("schedule") or "")
+                return self._json({"ok": True, "id": rid, "routines": self._routines()})
+            rid = (body.get("id") or "").strip()
+            if action == "update":
+                fields = {k: v for k, v in body.items() if k in
+                          ("enabled", "schedule", "title", "brief", "assignee")}
+                if self.office.update_routine(rid, **fields) is None:
+                    return self._json({"error": "no such routine"}, 404)
+            elif action == "delete":
+                if self.office.delete_routine(rid) is None:
+                    return self._json({"error": "no such routine"}, 404)
+            elif action == "run":
+                if self.office.run_routine_now(rid) is None:
+                    return self._json({"error": "no such routine"}, 404)
+            else:
+                return self._json({"error": "action must be add, update, delete or run"}, 400)
+        except (ValueError, KeyError) as exc:
+            return self._json({"error": str(exc).strip("'\"")}, 400)
+        return self._json({"ok": True, "routines": self._routines()})
 
     def _roster_write(self, action, body):
         """Hire, fire, or change one employee. RosterError carries a message
@@ -229,7 +323,9 @@ class Handler(BaseHTTPRequestHandler):
             "agents": store.agents(),
             "tasks": store.tasks(limit=60),
             "messages": store.messages(limit=60),
-            "approvals": store.pending_approvals(),
+            "approvals": [{**dict(a), "prefix": tools.prefix_for(a["action"])
+                           if a["kind"] == "shell" else ""}
+                          for a in store.pending_approvals()],
             "spend": {
                 "total": store.spend(),
                 "day": store.spend_since(time.time() - 86400),
@@ -243,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
             "paused": self.office._paused_reason or None,
             "paused_until": self.office._paused_until or None,
             "front_desk": bool(config.ROUTER and hasattr(self.office.backend, "structured")),
+            "careful_mode": self.office.careful_mode(),
+            "reviewer": config.REVIEWER_ID if config.REVIEWER_ID in config.STAFF_IDS else None,
+            "notifications": bool(config.NOTIFY_URL),
             "setup_needed": roster.setup_needed(store),
             "principal": self.office.principal(),
             "started_at": self.office.started_at,

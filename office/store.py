@@ -82,6 +82,18 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_by TEXT,
     fired INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS routines (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    assignee TEXT NOT NULL,
+    brief TEXT NOT NULL,
+    schedule TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run REAL,
+    next_run REAL,
+    created_by TEXT,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -151,6 +163,27 @@ def _drop_skill(db, name):
                        (json.dumps(kept), row["id"]))
 
 
+def _refresh_default_persona(db, role_id):
+    """Replace a roster persona with the current shipped default, but only if
+    it still matches an *earlier* shipped default - i.e. the owner never
+    edited it. Compared with whitespace collapsed, ignoring the sentence(s)
+    the new default added."""
+    from . import config
+    role = config.ROLE_DEFS.get(role_id)
+    row = db.execute("SELECT persona FROM roster WHERE id=?", (role_id,)).fetchone()
+    if role is None or row is None:
+        return
+    def norm(t):
+        return " ".join((t or "").split())
+    current, shipped = norm(row["persona"]), norm(role.persona)
+    if current == shipped:
+        return
+    # An older default is the new one minus what was appended; accept it when
+    # every sentence of the old text still appears, in order, in the new one.
+    if current and current in shipped:
+        db.execute("UPDATE roster SET persona=? WHERE id=?", (role.persona, role_id))
+
+
 def _add_tool(db, role_id, tool):
     """Grant one office tool to one roster row if it lacks it. Migration
     helper; safe to run twice."""
@@ -202,6 +235,13 @@ class Store:
         # Miles had no clock: asked the time he answered "no exact clock time
         # available". The DB row wins over the config default, so upgrade it.
         ("roster.manager_now", lambda db: _add_tool(db, "manager", "now")),
+        # Your verdict on a finished task, kept on its row so the card shows it.
+        ("tasks.feedback", "ALTER TABLE tasks ADD COLUMN feedback TEXT"),
+        ("roster.manager_add_routine", lambda db: _add_tool(db, "manager", "add_routine")),
+        # Iris's persona now names the <untrusted-data> tag her fetches arrive
+        # in. Only rows still carrying the shipped text are touched; an edited
+        # persona is the owner's and stays theirs.
+        ("roster.comms_untrusted_tag", lambda db: _refresh_default_persona(db, "comms")),
     )
 
     def _migrate(self):
@@ -281,6 +321,55 @@ class Store:
     def set_setting(self, key, value):
         self._run("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
                   (key, str(value)))
+
+    def json_setting(self, key, default=None):
+        raw = self.setting(key)
+        if raw is None:
+            return default if default is not None else []
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return default if default is not None else []
+
+    def set_json_setting(self, key, value):
+        self.set_setting(key, json.dumps(value))
+
+    # -- routines ----------------------------------------------------------
+    # Recurring work you configured: "sweep the inbox at 08:00". The ticker
+    # fires them; nothing here ever calls a model on its own initiative.
+    def add_routine(self, title, assignee, brief, schedule, next_run, created_by=None):
+        rid = new_id("rtn")
+        self._run(
+            "INSERT INTO routines (id,title,assignee,brief,schedule,enabled,next_run,"
+            "created_by,created_at) VALUES (?,?,?,?,?,1,?,?,?)",
+            (rid, title, assignee, brief, schedule, next_run, created_by, time.time()))
+        return rid
+
+    def routines(self):
+        return self._run("SELECT * FROM routines ORDER BY created_at", fetch="all") or []
+
+    def routine(self, rid):
+        return self._run("SELECT * FROM routines WHERE id=?", (rid,), fetch="one")
+
+    def update_routine(self, rid, **fields):
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self._run(f"UPDATE routines SET {cols} WHERE id=?", (*fields.values(), rid))
+
+    def delete_routine(self, rid):
+        self._run("DELETE FROM routines WHERE id=?", (rid,))
+
+    def due_routines(self, now=None):
+        return self._run(
+            "SELECT * FROM routines WHERE enabled=1 AND next_run IS NOT NULL"
+            " AND next_run<=? ORDER BY next_run", (now or time.time(),), fetch="all") or []
+
+    def open_task_for_routine(self, rid):
+        """A routine that is still running from last time does not pile up."""
+        return self._run(
+            "SELECT id FROM tasks WHERE created_by=? AND status IN ('queued','running')"
+            " LIMIT 1", (f"routine:{rid}",), fetch="one")
 
     # -- roster ------------------------------------------------------------
     # Who works here is state, not source. The table is seeded from

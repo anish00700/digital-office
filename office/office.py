@@ -11,7 +11,7 @@ import datetime as dt
 import logging
 import time
 
-from . import config, llm, notebook, roster, router, tools
+from . import config, llm, notebook, notify, roster, router, routines, tools
 from .bus import EventBus
 from .social import SocialLife
 from .store import Store
@@ -31,6 +31,8 @@ class AgentContext:
         self.task_id = task_id
         self.task_title = task_title
         self.result = ""
+        self.origin = "user"       # user | manager | routine | review
+        self.needs_you = ""        # the action that expired unanswered, if any
 
     # -- output --------------------------------------------------------
     def emit(self, kind, **payload):
@@ -106,6 +108,10 @@ class Office:
         ]
         for rid in config.STAFF_IDS:
             self._spawn_worker(rid)
+        tools.load_safety(self.store)
+        self.notifier = notify.Notifier(config.NOTIFY_URL, config.NOTIFY_TOKEN)
+        notify.start(self.bus, self.notifier,
+                     lambda: {r.id: r.name for r in config.ROSTER})
         self._recover_tasks()
         self.bus.publish("office.started", backend=self.backend.name,
                          auth=self.backend.describe_auth())
@@ -154,6 +160,10 @@ class Office:
             "paused": self._paused_reason or None,
             "paused_until": self._paused_until or None,
             "front_desk": bool(config.ROUTER and hasattr(self.backend, "structured")),
+            "careful_mode": self.careful_mode(),
+            "reviewer": config.REVIEWER_ID if config.REVIEWER_ID in config.STAFF_IDS else None,
+            "notifications": bool(config.NOTIFY_URL),
+            "routines": len([r for r in self.store.routines() if r["enabled"]]),
             "uptime_s": round(now - self.started_at),
             "workers_alive": {aid: (not t.done()) for aid, t in self._staff_tasks.items()},
             "queue_depth": {aid: q.qsize() for aid, q in self.queues.items()},
@@ -177,6 +187,193 @@ class Office:
         for task in running:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    # -- feedback, retry, review ---------------------------------------------
+    def set_feedback(self, task_id, up, note=""):
+        """Your verdict on a finished task. A note becomes a lesson for the
+        employee - the only feedback path that reaches their next task."""
+        row = self.store.task(task_id)
+        if row is None or row["status"] in ("queued", "running"):
+            return None
+        note = " ".join((note or "").split())[:240]
+        verdict = "up" if up else "down"
+        self.store.update_task(task_id, feedback=verdict)
+        learned = False
+        if note:
+            lesson = note if up else f"Feedback on '{row['title'][:50]}': {note}"
+            learned = bool(self.store.add_lesson(row["assignee"], lesson))
+        self.bus.publish("task.feedback", agent_id=row["assignee"], task_id=task_id,
+                         feedback=verdict, note=note, learned=learned)
+        return {"feedback": verdict, "learned": learned}
+
+    def retry_task(self, task_id):
+        """Run a settled task again, in place: same id, same brief, fresh
+        attempt. The card keeps its history of what happened last time."""
+        row = self.store.task(task_id)
+        if row is None or row["status"] in ("queued", "running", "done"):
+            return None
+        if row["assignee"] not in self.queues:
+            return None
+        def _do():
+            self._cancelled.discard(task_id)
+            self.store.update_task(task_id, status="queued", result=None, error=None,
+                                   stop=None, started_at=None, finished_at=None)
+            self._task_events[task_id] = asyncio.Event()
+            self.queues[row["assignee"]].put_nowait(task_id)
+            self.bus.publish("task.updated", agent_id=row["assignee"], task_id=task_id,
+                             status="queued", title=row["title"])
+            if row["created_by"] in ("user",) or row["created_by"].startswith("routine:"):
+                asyncio.create_task(self._reply_when_done(task_id, row["assignee"], False),
+                                    name=f"reply:{task_id}")
+        self._on_loop(_do)
+        return row
+
+    def careful_mode(self):
+        return (self.store.setting("careful_mode") or "0") == "1" \
+            and config.REVIEWER_ID in config.STAFF_IDS
+
+    def set_careful_mode(self, on):
+        self.store.set_setting("careful_mode", "1" if on else "0")
+        self.bus.publish("office.careful", on=self.careful_mode())
+        return self.careful_mode()
+
+    async def careful_review(self, text, ctx):
+        """Route a reply past the reviewer before it reaches you. If it holds,
+        the original goes out unchanged; otherwise the corrected version does,
+        marked as reviewed. A failed review never blocks the reply."""
+        if not self.careful_mode() or not text.strip():
+            return text
+        reviewer = config.REVIEWER_ID
+        try:
+            task_id = await self.assign(
+                reviewer, f"Review: {ctx.task_title or 'reply'}"[:80],
+                "Review the answer below before it is sent to your principal. Attack "
+                "it: wrong facts, missing risks, unverified claims stated as fact. If it "
+                "holds, reply with exactly the word APPROVED and nothing else. If not, "
+                "reply with the corrected answer only - no preamble, no commentary.\n\n"
+                f"---\n{text}", created_by="review")
+        except KeyError:
+            return text
+        rows = await self.wait_for([task_id], ctx.agent_id)
+        row = rows.get(task_id) or {}
+        verdict = (row.get("result") or "").strip()
+        name = config.role(reviewer).name if reviewer in config.STAFF_IDS else "the reviewer"
+        if row.get("status") != "done" or not verdict:
+            return text
+        if verdict.upper().startswith("APPROVED"):
+            return text + f"\n\n(checked by {name})"
+        return verdict + f"\n\n(corrected by {name}; the original was withheld)"
+
+    # -- routines -------------------------------------------------------------
+    def add_routine(self, title, assignee, brief, schedule, created_by="user"):
+        if assignee not in config.STAFF_IDS:
+            raise KeyError(f"no employee {assignee!r}")
+        schedule = routines.parse(schedule)
+        rid = self.store.add_routine(title[:80], assignee, brief, schedule,
+                                     routines.next_run(schedule), created_by)
+        self.bus.publish("routine.changed", action="added", id=rid, title=title[:80],
+                         assignee=assignee)
+        return rid
+
+    def update_routine(self, rid, **fields):
+        row = self.store.routine(rid)
+        if row is None:
+            return None
+        clean = {}
+        if "enabled" in fields:
+            clean["enabled"] = 1 if fields["enabled"] else 0
+            if clean["enabled"] and not row["enabled"]:
+                clean["next_run"] = routines.next_run(row["schedule"])
+        if "schedule" in fields:
+            clean["schedule"] = routines.parse(fields["schedule"])
+            clean["next_run"] = routines.next_run(clean["schedule"])
+        for key in ("title", "brief", "assignee"):
+            if key in fields and fields[key]:
+                if key == "assignee" and fields[key] not in config.STAFF_IDS:
+                    raise KeyError(f"no employee {fields[key]!r}")
+                clean[key] = str(fields[key])[:80 if key == "title" else 4000]
+        self.store.update_routine(rid, **clean)
+        self.bus.publish("routine.changed", action="updated", id=rid)
+        return self.store.routine(rid)
+
+    def delete_routine(self, rid):
+        row = self.store.routine(rid)
+        if row is None:
+            return None
+        self.store.delete_routine(rid)
+        self.bus.publish("routine.changed", action="deleted", id=rid, title=row["title"])
+        return row
+
+    def run_routine_now(self, rid):
+        row = self.store.routine(rid)
+        if row is None:
+            return None
+        asyncio.run_coroutine_threadsafe(self._fire_routine(row, manual=True), self.loop)
+        return row
+
+    async def _fire_routines(self):
+        if self._paused_reason:
+            return
+        for row in self.store.due_routines():
+            await self._fire_routine(row)
+
+    async def _fire_routine(self, row, manual=False):
+        """One routine, one direct task. `last_run`/`next_run` are written
+        *before* the task exists, so a crash between the two never fires it
+        twice; a routine still running from last time is skipped, not
+        stacked."""
+        rid = row["id"]
+        if manual:
+            self.store.update_routine(rid, last_run=time.time())
+        else:
+            self.store.update_routine(rid, last_run=time.time(),
+                                      next_run=routines.next_run(row["schedule"]))
+        if row["assignee"] not in self.queues:
+            self.store.update_routine(rid, enabled=0)
+            self._say_to_user(f"Routine '{row['title']}' is off: {row['assignee']} "
+                              f"is no longer on staff.")
+            return None
+        if self.store.open_task_for_routine(rid):
+            log.info("routine %s skipped: previous run still open", rid)
+            return None
+        task_id = await self.assign(row["assignee"], row["title"], row["brief"],
+                                    created_by=f"routine:{rid}")
+        self.bus.publish("routine.fired", id=rid, task_id=task_id, agent_id=row["assignee"],
+                         title=row["title"], manual=manual)
+        asyncio.create_task(self._reply_when_done(task_id, row["assignee"], False),
+                            name=f"reply:{task_id}")
+        return task_id
+
+    # -- safety (runtime allowlist) --------------------------------------------
+    def safety(self):
+        return {"allow": sorted(tools.EXTRA_ALLOW), "deny": sorted(tools.EXTRA_DENY),
+                "shipped": list(config.SHELL_AUTO_ALLOW)}
+
+    def set_safety(self, allow=None, deny=None):
+        def clean(items):
+            out = []
+            for item in items or []:
+                text = " ".join(str(item).split())[:80]
+                if text and text not in out and tools.prefix_for(text) == text:
+                    out.append(text)
+            return out
+        if allow is not None:
+            self.store.set_json_setting("shell_allow_extra", clean(allow))
+        if deny is not None:
+            self.store.set_json_setting("shell_deny_extra", clean(deny))
+        tools.load_safety(self.store)
+        self.bus.publish("office.safety", **self.safety())
+        return self.safety()
+
+    def always_allow(self, command):
+        prefix = tools.prefix_for(command)
+        if not prefix:
+            return None
+        allow = self.store.json_setting("shell_allow_extra", [])
+        if prefix not in allow:
+            allow.append(prefix)
+        self.set_safety(allow=allow)
+        return prefix
 
     # -- pause, resume, cancel ----------------------------------------------
     # All three are safe from any thread: they marshal onto the office loop.
@@ -458,8 +655,12 @@ class Office:
             return
         elif status in ("queued", "running"):
             text = "Still working on this - it has been a while. Check the task board."
+        elif status == "needs_you":
+            text = f"I need a decision from you before I can finish: {row['error']}"
         else:
             text = f"I couldn't finish this: {row['error'] or 'unknown error'}"
+        if status in ("done", "partial") and agent_id != config.REVIEWER_ID:
+            text = await self.careful_review(text, AgentContext(self, agent_id, task_id))
         self.store.add_message(agent_id, "user", text, task_id)
         self.bus.publish("agent.message_user", agent_id=agent_id, task_id=task_id,
                          text=text, routed=via_desk, status=status)
@@ -547,15 +748,21 @@ class Office:
                          task_id=ctx.task_id, id=approval_id, kind=kind,
                          action=action, detail=detail)
         self._set_status(ctx.agent_id, "blocked", action[:80])
+        # A routine at 3am waits for you until morning; a live request waits
+        # the usual quarter hour. Either way an expiry is remembered on the
+        # context so the task ends `needs_you`, not `failed`.
+        timeout = (config.ROUTINE_APPROVAL_TIMEOUT_S if ctx.origin == "routine"
+                   else config.APPROVAL_TIMEOUT_S)
         try:
-            approved, response = await asyncio.wait_for(
-                future.wait(), config.APPROVAL_TIMEOUT_S)
+            approved, response = await asyncio.wait_for(future.wait(), timeout)
             verdict = Verdict("approved" if approved else "declined")
         except asyncio.TimeoutError:
             self.store.decide_approval(approval_id, "expired")
             self.bus.publish("approval.decided", agent_id=ctx.agent_id,
                              id=approval_id, status="expired")
             verdict, response = Verdict("expired"), ""
+            if kind != "question":
+                ctx.needs_you = f"{kind}: {action}"[:300]
         finally:
             self._approval_waiters.pop(approval_id, None)
             self._set_status(ctx.agent_id, "working", ctx.task_title[:60])
@@ -645,6 +852,7 @@ class Office:
                          status="running")
 
         ctx = AgentContext(self, role.id, task_id, task["title"])
+        ctx.origin = _origin_of(task["created_by"])
         request = llm.RunRequest(
             agent_id=role.id,
             system=(config.fill(role.persona, self.principal())
@@ -683,8 +891,14 @@ class Office:
         # off by max_turns or the budget is *partial*: the office's cap did
         # its job, the text is whatever exists so far, and nobody gets
         # summoned to the manager's office for it. Only an error is a failure.
+        error = turn.error
         if turn.error:
             status = "failed"
+        elif ctx.needs_you:
+            # An approval expired unanswered. Not a failure: the work is
+            # waiting on you, and the card says exactly what for.
+            status = "needs_you"
+            error = f"waiting on your decision - {ctx.needs_you}"
         elif not ctx.result and turn.stop in llm.PARTIAL_STOPS:
             status = "partial"
         else:
@@ -698,10 +912,11 @@ class Office:
                 + (f" ({turn.error.splitlines()[0][:70]})" if turn.error else
                    f" (stopped: {turn.stop})" if status == "partial" else ""))
         self.store.update_task(task_id, status=status, result=result,
-                               error=turn.error or None, stop=turn.stop or None,
+                               error=error or None, stop=turn.stop or None,
                                finished_at=time.time())
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
-                         status=status, stop=turn.stop, result=result[:400])
+                         status=status, stop=turn.stop, result=result[:400],
+                         title=task["title"], routine=(ctx.origin == "routine"))
         if status == "failed":
             self._on_failure(role.id, task_id, turn.error)
 
@@ -885,6 +1100,7 @@ class Office:
             await asyncio.sleep(5)
             try:
                 self._tick()
+                await self._fire_routines()
             except Exception:
                 log.exception("ticker failed")
 
@@ -906,6 +1122,15 @@ class Office:
             removed = self.store.prune(config.RETENTION_DAYS)
             if any(removed.values()):
                 log.info("pruned %s", removed)
+
+
+def _origin_of(created_by):
+    created_by = created_by or "user"
+    if created_by.startswith("routine:"):
+        return "routine"
+    if created_by in ("user", "manager", "review"):
+        return created_by
+    return "manager"                     # any other employee id
 
 
 class Verdict(str):

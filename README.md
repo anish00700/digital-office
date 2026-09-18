@@ -332,6 +332,38 @@ default; the ones that cost money are marked `BUDGET` in the source.
   work waits, running calls finish. **cancel** on a queued or running card stops
   that task now and its worker takes the next one.
 
+**It runs your day, and waits for you when it must**
+- **Routines** (Staff → Routines, or ask Miles): `daily 08:00`, `weekdays 18:00`,
+  `every 30m`. Each firing is a direct task to one employee with a brief you wrote,
+  so the cost is predictable and there is no manager turn. The result is posted to
+  chat. Nothing fires while paused; a routine still running from last time is
+  skipped, not stacked; `last_run` is written before the task exists, so a crash
+  never double-fires.
+- **Approvals while you are away**: a routine that needs an approval waits
+  `OFFICE_ROUTINE_APPROVAL_TIMEOUT` (8h) instead of 15 minutes. If nobody answers,
+  the task ends **`needs you`**, with the pending action on its card and a Retry
+  button - never `failed`, never a scolding.
+- **Push notifications** (`OFFICE_NOTIFY_URL`: an ntfy.sh topic or any JSON
+  webhook, optional `OFFICE_NOTIFY_TOKEN`): approvals, questions, Miles' replies,
+  pauses, needs-you tasks and routine failures. One push per kind per minute,
+  bodies capped at 200 characters, and never a command string - a shell command in
+  a push is a secret in somebody else's log.
+
+**You can teach it, and check its work**
+- 👍/👎 on any finished task card. A note on a thumbs-down becomes one of that
+  employee's lessons (six kept, oldest drops off), carried into every later task.
+  Click anyone on the floor to read, add, or forget their notes.
+- **Careful mode** (🛡 in the top bar) routes Miles' replies and routed answers past
+  the Red Team role before you see them: "checked by Sol" or a corrected version.
+  One extra turn per reply; off by default; needs a reviewer on staff
+  (`OFFICE_REVIEWER`, default `critic`).
+- **Fetched content cannot pose as instructions**: Slack and mail arrive inside
+  `<untrusted-data>` tags with the rule restated where the content ends, and
+  Iris's persona names the tag.
+- **The shell allowlist is yours** (Staff → Safety): "Approve & always allow
+  `kubectl rollout`" on an approval card records binary + subcommand, never a bare
+  binary; a deny you add beats every allow, including the shipped list.
+
 **Spend is bounded**
 - `OFFICE_TASK_BUDGET_USD` (default $0.15) is enforced by the SDK per task.
 - `OFFICE_DAILY_BUDGET_USD` (default $2.00) pauses the entire office for a rolling

@@ -308,6 +308,42 @@ body {
 .card.failed { border-left-color: var(--bad); }
 .card.partial { border-left-color: var(--warn); }
 .card.cancelled { opacity: .5; border-left-color: var(--ink-dim); }
+.card.needs_you { border-left-color: var(--warn); background: rgba(217,164,65,.06); }
+.dotStatus.needs_you { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.cardTools { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.cardTools button { font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 6px;
+  background: transparent; color: var(--ink-dim); border: 1px solid var(--line); cursor: pointer; }
+.cardTools button:hover { color: var(--ink); border-color: var(--accent); }
+.cardTools button.on { color: var(--ok); border-color: var(--ok); }
+.cardTools button.down.on { color: var(--bad); border-color: var(--bad); }
+.cardTools .retry { color: var(--warn); border-color: rgba(217,164,65,.5); }
+.lessons { margin: 10px 16px 0; font-size: 12px; }
+.lessons h4 { margin: 0 0 6px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-dim); }
+.lesson { display: flex; gap: 6px; align-items: flex-start; padding: 4px 0; border-top: 1px solid var(--line); color: var(--ink); }
+.lesson span { flex: 1; }
+.lesson button, .lessonAdd button { font: inherit; font-size: 11px; background: none; border: 1px solid var(--line); color: var(--ink-dim); border-radius: 6px; cursor: pointer; padding: 1px 6px; }
+.lesson button:hover { color: var(--bad); border-color: var(--bad); }
+.lessonAdd { display: flex; gap: 6px; margin-top: 6px; }
+.lessonAdd input { flex: 1; font: inherit; font-size: 12px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.approval .always { font-size: 11px; opacity: .85; }
+.sSection { margin: 22px 0 4px; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-dim); }
+.rRow { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; align-items: center; }
+.rRow .rMeta { color: var(--ink-dim); font-size: 12px; }
+.rRow .rTools { display: flex; gap: 6px; }
+.rRow.off { opacity: .55; }
+.rForm { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.rForm textarea, .rForm input, .rForm select { font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.rForm textarea { grid-column: 1 / -1; min-height: 64px; resize: vertical; }
+.rForm .rSubmit { grid-column: 1 / -1; justify-self: start; }
+.safetyList { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
+.safetyTag { font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; display: inline-flex; gap: 6px; align-items: center; }
+.safetyTag.deny { border-color: rgba(207,95,82,.5); }
+.safetyTag button { background: none; border: none; color: var(--ink-dim); cursor: pointer; font: inherit; padding: 0; }
+.safetyTag button:hover { color: var(--bad); }
+.safetyAdd { display: flex; gap: 6px; margin-bottom: 8px; }
+.safetyAdd input { flex: 1; font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.pill.ghostPill.careful.on { color: var(--ok); border-color: rgba(111,174,99,.5); }
+.pill.ghostPill:disabled { opacity: .45; cursor: default; }
 .dotStatus.cancelled { background: var(--ink-dim); }
 .cardFoot { font-size: 11px; color: var(--ink-dim); margin-top: 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .cardCancel { margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 6px;
@@ -481,8 +517,27 @@ body {
   .tasks { display: none; }
 }
 @media (max-width: 780px) {
-  .layout { grid-template-columns: minmax(0,1fr); }
-  .inspector { display: none; }
+  /* A phone shows the conversation and the controls; the floor is a
+     postcard above them. Everything you must be able to do away from your
+     desk - read replies, approve, cancel, pause - is reachable here. */
+  .layout { grid-template-columns: minmax(0,1fr); grid-template-rows: 38vh minmax(0,1fr); }
+  .tasks { display: none; }
+  .inspector { display: flex; border-left: none; border-top: 1px solid var(--line); }
+  .topbar { flex-wrap: wrap; gap: 6px; padding: 8px 10px; height: auto; }
+  .composer input { min-width: 0; }
+  .composer button { flex: none; padding: 10px 12px; }
+  .toWrap { max-width: 30%; overflow: hidden; }
+  .toWrap select { min-width: 0; max-width: 100%; }
+  .topbar .stat { font-size: 12px; }
+  .topbar .pill { padding: 4px 9px; font-size: 12px; }
+  .brand { width: 100%; }
+  .composer { padding: 8px; gap: 6px; }
+  .toWrap { max-width: 34%; }
+  .sheet { width: 96vw; max-height: 92vh; padding: 4px 12px 14px; }
+  .approval .actions { flex-wrap: wrap; }
+  .approval code { word-break: break-all; }
+  .banner { flex-wrap: wrap; }
+  .rForm { grid-template-columns: 1fr; }
 }
 
 /* ---- staff panel ------------------------------------------------------- */

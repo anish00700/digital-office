@@ -119,7 +119,17 @@ async def test_front_desk_respects_the_floor_and_the_kill_switch():
     try:
         async def timid(system, prompt, schema, model=""):
             return {"action": "route", "target": "writer", "confidence": 0.5}, Turn()
-        office.backend.structured = timid
+
+        class _Timid:
+            name = "timid"
+            structured = staticmethod(timid)
+
+            def describe_auth(self):
+                return "none"
+
+            async def run(self, req, ctx, on_event):
+                return Turn(text="ok", input_tokens=10, output_tokens=5)
+        office.backend = _Timid()          # never patch the shared singleton
         import json
         before = len(_events(office, "router.decided"))
         office.submit_user_message("write me something short")
