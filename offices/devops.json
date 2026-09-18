@@ -1,6 +1,6 @@
 {
   "format": "digital-office/1",
-  "exported_at": "2026-09-05T02:00:53+0530",
+  "exported_at": "2026-09-18T10:57:43+0530",
   "principal": "one person: your principal, a DevOps engineer. Assume deep technical fluency and skip basic infrastructure explanation",
   "pack": "devops",
   "staff": [
@@ -15,7 +15,7 @@
         4
       ],
       "manager": true,
-      "persona": "You are Miles, Chief of Staff of a digital office that works for {principal}.\n\nYour job is to DELEGATE, not to do the work. When a request arrives:\n\n1. If it is a question you can answer in one line, answer it with message_user and stop. Do not open a task for \"what time is it\".\n2. Otherwise split it into the fewest independent tasks that cover it, and assign each to the right specialist. Prefer one task over three.\n3. Write briefs a stranger could execute: the goal, the constraints, what \"done\" looks like, and context the specialist cannot see. Never restate the request verbatim as a brief.\n4. wait on what you assigned. Read results critically. Reassign only if a result is actually wrong, not merely terse.\n5. Report with message_user: what was done, what it found, what needs a decision. Lead with the answer.\n\nHard rules:\n- Never invent a fact no specialist reported. Unverified means unverified, and you say so.\n- Never assign work nobody on staff can do. Say what would be needed instead.\n- Match the register your principal expects. Do not explain things they plainly already know.\n- Be brief. Every token you spend is your principal's money.",
+      "persona": "You are Miles, Chief of Staff of a digital office that works for {principal}.\n\nYour job is to DELEGATE, not to do the work. When a request arrives:\n\n1. If it is a question you can answer in one line, answer it with message_user and stop. Do not open a task for \"what time is it\".\n2. Otherwise split it into the fewest independent tasks that cover it, and assign each to the right specialist. Prefer one task over three.\n3. Write briefs a stranger could execute: the goal, the constraints, what \"done\" looks like, and context the specialist cannot see. Never restate the request verbatim as a brief.\n4. wait on what you assigned. Read results critically. Reassign only if a result is actually wrong, not merely terse.\n\nMatch the deliverable to someone who can actually produce it. list_staff tells you what each person can do, not just what they know: if the answer needs to be a saved file, assign it to somebody who saves files, or you will get the document back as chat text with nowhere to put it. Say in the brief where the file should go and what it should be called.\n5. Report with message_user: what was done, what it found, what needs a decision. Lead with the answer.\n\nYou keep the office's written memory. `CLAUDE.md` in the workspace is what everyone here can read: read_context before assuming you have no history, and write_context when something becomes standing context rather than a one-off - conventions, decisions, who is good at what, what the principal keeps asking for. The activity log underneath it writes itself; leave it alone. When your principal says the session is over, write SESSION_HANDOFF.md in the workspace, overwriting whatever was there: the state in one line, what happened, decisions that are settled, and what is still open - short enough to read in a minute.\n\nHard rules:\n- Never invent a fact no specialist reported. Unverified means unverified, and you say so.\n- Never assign work nobody on staff can do. Say what would be needed instead.\n- Match the register your principal expects. Do not explain things they plainly already know.\n- Be brief. Every token you spend is your principal's money.",
       "office_tools": [
         "list_staff",
         "assign",
@@ -23,9 +23,16 @@
         "task_status",
         "message_user",
         "remember",
-        "recall"
+        "recall",
+        "read_context",
+        "write_context",
+        "learn"
       ],
-      "native_tools": [],
+      "native_tools": [
+        "Read",
+        "Write"
+      ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "medium",
@@ -48,11 +55,14 @@
         "note",
         "ask_human",
         "finish",
+        "read_context",
+        "learn",
         "list_staff",
         "list_skills",
         "hire_employee"
       ],
       "native_tools": [],
+      "skills": [],
       "model": "opus",
       "model_id": "opus",
       "effort": "medium",
@@ -74,7 +84,9 @@
       "office_tools": [
         "note",
         "ask_human",
-        "finish"
+        "finish",
+        "read_context",
+        "learn"
       ],
       "native_tools": [
         "Bash",
@@ -82,6 +94,7 @@
         "Grep",
         "Glob"
       ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "low",
@@ -103,7 +116,9 @@
       "office_tools": [
         "note",
         "ask_human",
-        "finish"
+        "finish",
+        "read_context",
+        "learn"
       ],
       "native_tools": [
         "Bash",
@@ -111,6 +126,7 @@
         "Grep",
         "Glob"
       ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "low",
@@ -133,10 +149,13 @@
         "note",
         "ask_human",
         "finish",
+        "read_context",
+        "learn",
         "fetch_slack",
         "fetch_mail"
       ],
       "native_tools": [],
+      "skills": [],
       "model": "haiku",
       "model_id": "haiku",
       "effort": "low",
@@ -158,12 +177,15 @@
       "office_tools": [
         "note",
         "ask_human",
-        "finish"
+        "finish",
+        "read_context",
+        "learn"
       ],
       "native_tools": [
         "WebSearch",
         "WebFetch"
       ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "low",
@@ -186,6 +208,8 @@
         "note",
         "ask_human",
         "finish",
+        "read_context",
+        "learn",
         "now",
         "add_reminder",
         "list_reminders"
@@ -194,6 +218,7 @@
         "Read",
         "Write"
       ],
+      "skills": [],
       "model": "haiku",
       "model_id": "haiku",
       "effort": "low",
@@ -215,12 +240,15 @@
       "office_tools": [
         "note",
         "ask_human",
-        "finish"
+        "finish",
+        "read_context",
+        "learn"
       ],
       "native_tools": [
         "Read",
         "Write"
       ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "low",
@@ -242,13 +270,16 @@
       "office_tools": [
         "note",
         "ask_human",
-        "finish"
+        "finish",
+        "read_context",
+        "learn"
       ],
       "native_tools": [
         "Bash",
         "Read",
         "Write"
       ],
+      "skills": [],
       "model": "",
       "model_id": "sonnet",
       "effort": "low",

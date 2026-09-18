@@ -285,7 +285,11 @@ default; the ones that cost money are marked `BUDGET` in the source.
   does not compound across tasks.
 - `effort: low` for workers, `medium` for the manager. Lower effort means fewer,
   more consolidated tool calls and less preamble.
-- `max_turns` caps tool round trips per role (5–14).
+- `max_turns` caps tool round trips per role (5–14). A task that hits its cap
+  (or the per-task budget) finishes as **`partial`**, not `done`: it keeps the
+  text produced so far, the card says what stopped it, the manager's `wait`
+  sees `[partial - stopped at max turns, not finished]`, and nobody is summoned
+  to the manager's office for it. Only an actual error is `failed`.
 - Personas instruct brevity explicitly, with word limits where it matters.
 
 **Output is capped**
@@ -294,6 +298,11 @@ default; the ones that cost money are marked `BUDGET` in the source.
   any agent loop.
 - The `api` backend caches the system prompt and tool definitions with a 1h TTL,
   so the stable prefix is served at ~10% of input price after the first call.
+- Whether caching is actually happening is a number, not a hope: the usage
+  modal's **Cache hit** card and `cache_hit_ratio` in `/api/health` are the
+  share of prompt tokens read back from cache. A persona alone is often below
+  the minimum cacheable prefix, so a figure near 0% on a live backend means the
+  stable prefix needs to be longer, not that caching is off.
 
 **Spend is bounded**
 - `OFFICE_TASK_BUDGET_USD` (default $0.15) is enforced by the SDK per task.

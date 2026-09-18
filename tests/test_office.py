@@ -22,6 +22,7 @@ os.environ.setdefault("OFFICE_DATA_DIR", os.path.join(_TMP, "data"))
 os.environ.setdefault("OFFICE_WORKSPACE", os.path.join(_TMP, "workspace"))
 
 from office import config, notebook, roster, skills  # noqa: E402
+from office import llm, tools  # noqa: E402
 from office.store import Store  # noqa: E402
 
 
@@ -310,3 +311,108 @@ def test_cache_reads_are_cheap_relative_to_output():
     assert pin * config.CACHE_READ_DISCOUNT < pin
     assert pin * config.CACHE_READ_DISCOUNT * 10 <= pout
     assert pin * config.CACHE_WRITE_MULTIPLIER > pin
+
+
+# ------------------------------------------------------ correctness (P1) --
+
+def test_sdk_stop_reasons_map_to_one_vocabulary():
+    """The CLI reports a max_turns cut-off as an *error* result and exits
+    non-zero. Read literally, every task that hit its cap was a crash and
+    its author was summoned to the manager's office."""
+    stop = llm._sdk_stop
+    assert stop(subtype="error_max_turns", is_error=True) == "max_turns"
+    assert stop(terminal_reason="max_turns", is_error=True) == "max_turns"
+    assert stop(subtype="error_max_budget_usd", is_error=True) == "budget_exhausted"
+    assert stop(subtype="success", stop_reason="end_turn") == "end_turn"
+    assert stop(subtype="success", terminal_reason="completed") == "end_turn"
+    assert stop(subtype="success", is_error=True, api_status=429) == "api_error"
+    assert stop(subtype="error_during_execution", is_error=True) == "error_during_execution"
+    assert stop(terminal_reason="aborted_streaming") == "cancelled"
+    assert stop(subtype="success", stop_reason="max_tokens") == "max_tokens"
+    for reason in ("max_turns", "budget_exhausted", "max_tokens"):
+        assert reason in llm.PARTIAL_STOPS
+    assert "end_turn" not in llm.PARTIAL_STOPS
+
+
+def test_haiku_never_gets_the_params_it_rejects():
+    """effort + adaptive thinking is a 400 on haiku: two roles broken on the
+    api backend, every task."""
+    for effort in ("low", "medium", "high"):
+        kw = llm._sampling_kwargs("claude-haiku-4-5", effort)
+        assert "output_config" not in kw
+        assert kw.get("thinking", {}).get("type") != "adaptive"
+        if "thinking" in kw:
+            assert kw["max_tokens"] > kw["thinking"]["budget_tokens"]
+    assert "thinking" not in llm._sampling_kwargs("claude-haiku-4-5", "low")
+    kw = llm._sampling_kwargs("claude-sonnet-5", "medium")
+    assert kw["output_config"] == {"effort": "medium"}
+    assert kw["thinking"] == {"type": "adaptive"}
+
+
+def test_wait_keeps_every_task_and_never_hides_an_error():
+    """One 4000-char clip across all results lost the middle tasks with no
+    marker naming which; and `result or error` meant the manager saw
+    "(no output)" where the error should have been."""
+    long = "x" * 5000
+    rows = {
+        "t1": {"status": "done", "title": "one", "result": long},
+        "t2": {"status": "failed", "title": "two", "result": "(no output)",
+               "error": "connection refused talking to staging"},
+        "t3": {"status": "partial", "title": "three", "result": "half an answer",
+               "stop": "max_turns"},
+        "t4": {"status": "running", "title": "four"},
+        "t5": {"status": "done", "title": "five", "result": long},
+    }
+    out = "\n\n".join(tools._wait_entry(k, v) for k, v in rows.items())
+    for tid in rows:
+        assert f"--- {tid} [" in out, f"{tid} vanished from wait output"
+    assert "ERROR: connection refused" in out
+    assert "(no output)\n" not in out.split("--- t2")[1].split("--- t3")[0]
+    assert "stopped at max turns, not finished" in out
+    assert "still running" in out
+    # each long result is clipped on its own, not the whole report
+    assert out.count("chars truncated") == 2
+    assert len(out) < 2 * tools.WAIT_RESULT_CHARS + 800
+
+
+def test_migration_adds_stop_and_strips_the_handoff_skill(store):
+    cols = {r[1] for r in store.db.execute("PRAGMA table_info(tasks)")}
+    assert "stop" in cols
+
+    roster.load(store)
+    roster.install_pack(store, "devops", "p")
+    row = dict(store.roster_rows()[0])
+    row["skills"] = json.dumps(["session-handoff:session-handoff", "other:thing"])
+    store.write_role(row)
+    # Re-run just that migration, as an upgraded database would.
+    store.db.execute("DELETE FROM settings WHERE key='migrated:roster.no_session_handoff'")
+    store._migrate()
+    got = json.loads(store.db.execute(
+        "SELECT skills FROM roster WHERE id=?", (row["id"],)).fetchone()[0])
+    assert got == ["other:thing"]
+    # and running it again changes nothing
+    store.db.execute("DELETE FROM settings WHERE key='migrated:roster.no_session_handoff'")
+    store._migrate()
+
+
+def test_manager_default_has_no_skill_grant():
+    """A skill grant widens setting_sources, which loads the workspace
+    CLAUDE.md - rewritten after every task - into every manager request."""
+    assert config.ROLE_DEFS["manager"].skills == ()
+
+
+def test_shipped_devops_office_matches_the_role_definitions():
+    """offices/devops.json is what a fresh install imports. It had drifted
+    from ROLE_DEFS (no read_context/learn), which silently turned learning
+    off for anyone who used it."""
+    doc = json.load(open(os.path.join(os.path.dirname(__file__), "..",
+                                      "offices", "devops.json")))
+    staff = {s["id"]: s for s in doc["staff"]}
+    assert set(staff) == set(config.CORE_IDS) | set(config.PACKS["devops"]["staff"])
+    for sid, entry in staff.items():
+        role = config.ROLE_DEFS[sid]
+        assert tuple(entry["office_tools"]) == role.office_tools, sid
+        assert tuple(entry["native_tools"]) == role.native_tools, sid
+        assert tuple(entry.get("skills", ())) == role.skills, sid
+        assert entry["model"] == role.model and entry["effort"] == role.effort, sid
+        assert entry["max_turns"] == role.max_turns, sid

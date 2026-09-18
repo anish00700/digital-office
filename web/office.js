@@ -2215,13 +2215,18 @@ function renderUsage() {
     return c;
   };
   const reads = d.cost_split.find(k => k.kind === 'cache_read') || { share: 0 };
+  // Share of prompt tokens that came from cache. Near zero means the stable
+  // prefix is too short to be cached at all - the persona alone often is.
+  const promptTok = (t.input || 0) + (t.cache_read || 0) + (t.cache_write || 0);
+  const hitPct = promptTok ? Math.round(100 * (t.cache_read || 0) / promptTok) : 0;
   cards.append(
     card('Tokens', niceTokens(t.tokens), t.tokens.toLocaleString() + ' exactly'),
     card('Cost', '$' + (t.cost || 0).toFixed(4),
          d.token_budget ? '' : 'notional on a subscription'),
     card('Turns', String(t.turns), 'model calls'),
-    card('Cache saving', niceTokens(t.cache_read),
-         `read back at a tenth of input price — ${reads.share}% of spend`),
+    card('Cache hit', `${hitPct}%`,
+         `${niceTokens(t.cache_read)} read back at a tenth of input price — `
+         + `${reads.share}% of spend`),
   );
   body.appendChild(cards);
 
@@ -2347,7 +2352,7 @@ function renderBoard() {
   const groups = [
     ['In progress', S.tasks.filter(t => t.status === 'running')],
     ['Queued', S.tasks.filter(t => t.status === 'queued')],
-    ['Finished', S.tasks.filter(t => ['done', 'failed'].includes(t.status)).slice(0, 14)],
+    ['Finished', S.tasks.filter(t => ['done', 'partial', 'failed'].includes(t.status)).slice(0, 14)],
   ];
   const board = $('board');
   board.innerHTML = '';
@@ -2377,13 +2382,20 @@ function renderBoard() {
 
       // Results are often the thing you actually want to read, and a title
       // attribute hides them behind a hover you have to know about.
+      // A partial task holds a real result that simply is not finished:
+      // say so on the card, or a half answer reads as a whole one.
+      if (t.status === 'partial') {
+        const why = String(t.stop || 'cap').replace(/_/g, ' ');
+        card.querySelector('.cardMeta').appendChild(
+          el('span', 'cardStop', `stopped early: ${why}`));
+      }
       const body = (t.status === 'failed' ? t.error : t.result) || t.brief || '';
       if (body) {
         const more = document.createElement('div');
         more.className = 'cardBody hidden';
         more.textContent = body;
 
-        if (t.status === 'done' && t.result) {
+        if ((t.status === 'done' || t.status === 'partial') && t.result) {
           const save = el('button', 'ghost cardSave', 'Save as file');
           const slug = (t.title || 'result').toLowerCase()
             .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
@@ -3043,7 +3055,11 @@ function appendLine(feed, ev) {
   let text, cls = kind;
   if (kind === 'tool') text = `${p.tool}${p.args ? ' · ' + p.args : ''}`;
   else if (kind === 'created') { text = `new task: ${p.title} → ${p.assignee}`; cls = 'tool'; }
-  else if (kind === 'updated') { text = `task ${p.status}`; cls = 'tool'; }
+  else if (kind === 'updated') {
+    text = `task ${p.status}` + (p.status === 'partial' && p.stop
+      ? ` (stopped early: ${String(p.stop).replace(/_/g, ' ')})` : '');
+    cls = 'tool';
+  }
   else if (kind === 'requested') { text = `needs approval: ${p.action}`; cls = 'error'; }
   else if (kind === 'decided') { text = `approval ${p.status}`; cls = 'tool'; }
   else if (kind === 'break') { text = `heads to the break room — "${p.line}"`; cls = 'social'; }

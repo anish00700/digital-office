@@ -40,6 +40,61 @@ class Turn:
     cache_read: int = 0
     cache_write: int = 0
     error: str = ""
+    turns: int = 0            # model calls the run took (SDK: num_turns)
+    api_status: int = 0       # HTTP status of a failing API call, else 0
+
+
+# Ways a run can end that are the office's own caps, not the agent's fault.
+# A task that stops on one of these is *partial*: it holds whatever was
+# produced so far, and the manager is told it was cut off, not finished.
+PARTIAL_STOPS = ("max_turns", "budget_exhausted", "max_tokens")
+
+
+def _sdk_stop(subtype="", terminal_reason="", stop_reason="", api_status=0,
+              is_error=False):
+    """One stop reason from the SDK's three overlapping fields.
+
+    The CLI reports a max_turns or budget cut-off as an *error* result
+    (subtype error_max_turns / error_max_budget_usd, is_error true) and then
+    exits non-zero. Read literally, every task that hit its cap looked like
+    a crash. Here those become plain stop reasons; only the rest are errors.
+    """
+    subtype, terminal_reason = subtype or "", terminal_reason or ""
+    if subtype == "error_max_turns" or terminal_reason == "max_turns":
+        return "max_turns"
+    if subtype == "error_max_budget_usd":
+        return "budget_exhausted"
+    if terminal_reason.startswith("aborted"):
+        return "cancelled"
+    if api_status:
+        return "api_error"
+    if subtype.startswith("error"):
+        return subtype
+    if is_error:
+        return "error"
+    if stop_reason and stop_reason not in ("end_turn", "stop_sequence"):
+        return stop_reason                      # e.g. max_tokens
+    return "end_turn"
+
+
+def _sampling_kwargs(model, effort):
+    """Per-model sampling controls for the Messages API.
+
+    Haiku rejects `output_config.effort` and adaptive thinking - a 400 on
+    every call, which used to break every role on the cheap model. It gets a
+    fixed thinking budget sized by effort instead, and none at all on low,
+    which is what a cheap role usually wants. max_tokens must exceed the
+    thinking budget, so it grows with it.
+    """
+    if "haiku" in (model or ""):
+        budget = {"medium": 2048, "high": 6144}.get(effort, 0)
+        if not budget:
+            return {"max_tokens": 4000}
+        return {"max_tokens": 4000 + budget,
+                "thinking": {"type": "enabled", "budget_tokens": budget}}
+    return {"max_tokens": 4000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": effort}}
 
 
 @dataclass
@@ -130,7 +185,10 @@ class AgentSDKBackend:
             annotations = sdk.ToolAnnotations(
                 readOnlyHint=spec.read_only,
                 destructiveHint=not spec.read_only,
-                # BUDGET: keeps oversized results out of the context window.
+                # Not a clamp. This is the size up to which Claude Code keeps
+                # a tool result inline instead of spilling it to a file and
+                # showing a preview. It is set to the figure truncate() already
+                # enforces in the handler above, so that path is never taken.
                 maxResultSizeChars=config.MAX_TOOL_RESULT_CHARS,
             )
         return sdk.tool(spec.name, spec.description, spec.schema,
@@ -206,7 +264,20 @@ class AgentSDKBackend:
                             on_event("tool", tool=_short_tool(block.name),
                                      args=_short_args(getattr(block, "input", {})))
                 elif kind == "ResultMessage":
-                    turn.stop = getattr(message, "terminal_reason", "") or "stop"
+                    is_error = bool(getattr(message, "is_error", False))
+                    api_status = getattr(message, "api_error_status", 0) or 0
+                    turn.stop = _sdk_stop(
+                        subtype=getattr(message, "subtype", ""),
+                        terminal_reason=getattr(message, "terminal_reason", ""),
+                        stop_reason=getattr(message, "stop_reason", ""),
+                        api_status=api_status, is_error=is_error)
+                    turn.turns = getattr(message, "num_turns", 0) or 0
+                    turn.api_status = api_status
+                    if is_error and turn.stop not in PARTIAL_STOPS:
+                        errs = [str(e) for e in (getattr(message, "errors", None) or []) if e]
+                        turn.error = truncate("; ".join(errs)
+                                              or getattr(message, "result", None)
+                                              or turn.stop, 600)
                     # ResultMessage carries total_cost_usd directly, and `usage`
                     # is a plain dict - not a nested cost object with attributes.
                     # Reading it the other way silently recorded zeroes for
@@ -224,8 +295,29 @@ class AgentSDKBackend:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            turn.error = f"{type(exc).__name__}: {exc}"
+            # After an error result the CLI exits non-zero and the SDK raises
+            # ResultError carrying that same result. Everything worth knowing
+            # was read off the ResultMessage above; the exception confirms it.
+            # For a cut-off there is nothing to add - and nothing to blame.
+            result_error = (getattr(sdk, "ResultError", None)
+                            or getattr(getattr(sdk, "_errors", None), "ResultError", None))
+            if result_error is not None and isinstance(exc, result_error):
+                if turn.stop == "end_turn":
+                    turn.stop = _sdk_stop(subtype=exc.subtype,
+                                          terminal_reason=exc.terminal_reason,
+                                          api_status=exc.api_error_status or 0,
+                                          is_error=True)
+                turn.api_status = exc.api_error_status or turn.api_status
+                if turn.stop not in PARTIAL_STOPS and not turn.error:
+                    turn.error = truncate(
+                        "; ".join(e for e in exc.errors if e) or exc.result or str(exc), 600)
+            else:
+                turn.error = f"{type(exc).__name__}: {exc}"
+
+        if turn.error:
             on_event("error", text=turn.error)
+        elif turn.stop in PARTIAL_STOPS:
+            on_event("say", text=f"(stopped early: {turn.stop.replace('_', ' ')})")
 
         turn.text = "\n\n".join(t.strip() for t in texts if t.strip())
         return turn
@@ -310,12 +402,10 @@ class APIBackend:
             try:
                 resp = self.client.messages.create(
                     model=model,
-                    max_tokens=4000,
                     system=system,
                     messages=messages,
                     tools=tools or anthropic.NOT_GIVEN,
-                    thinking={"type": "adaptive"},
-                    output_config={"effort": req.effort},
+                    **_sampling_kwargs(model, req.effort),
                 )
             except anthropic.NotFoundError as exc:
                 fallback = self._model(config.MODEL_SMART)
@@ -452,8 +542,16 @@ class MockBackend:
                 on_event("tool", tool=random.choice(names), args="")
                 await asyncio.sleep(random.uniform(0.4, 1.0))
             if random.random() < self.FAILURE_RATE:
-                turn.error = random.choice(self.EXCUSES)
-                on_event("error", text=turn.error)
+                excuse = random.choice(self.EXCUSES)
+                if excuse.startswith("ran out of turns"):
+                    # The office's cap, not a failure: a partial result.
+                    turn.stop = "max_turns"
+                    turn.text = (f"[mock] {config.role(req.agent_id).name} got halfway: "
+                                 f"{truncate(req.prompt, 100)}")
+                    on_event("say", text="(stopped early: max turns)")
+                else:
+                    turn.error = excuse
+                    on_event("error", text=turn.error)
             else:
                 turn.text = (f"[mock] {config.role(req.agent_id).name} handled: "
                              f"{truncate(req.prompt, 160)}")

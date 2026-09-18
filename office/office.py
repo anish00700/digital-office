@@ -142,7 +142,15 @@ class Office:
             "model_slots_free": self._model_slots._value,
             "last_event_age_s": round(now - (self.store.last_event_ts() or self.started_at)),
             "tz": str(config.TZ or "system"),
+            # Share of prompt tokens served from cache in the rolling window.
+            # Near zero means the stable prefix is too short to cache at all.
+            "cache_hit_ratio": self.cache_hit_ratio(now - config.SESSION_WINDOW_S),
         }
+
+    def cache_hit_ratio(self, since=0.0):
+        t = self.store.usage_totals(since)
+        prompt = (t.get("input") or 0) + (t.get("cache_read") or 0) + (t.get("cache_write") or 0)
+        return round((t.get("cache_read") or 0) / prompt, 3) if prompt else 0.0
 
     async def stop(self):
         running = self._workers + list(self._staff_tasks.values())
@@ -320,8 +328,10 @@ class Office:
 
     # -- human in the loop ----------------------------------------------
     async def request_approval(self, ctx, kind, action, detail=""):
-        approved, _ = await self._await_human(ctx, kind, action, detail)
-        return approved
+        """Returns a Verdict: truthy when approved, and readable as
+        "declined" or "expired" when not."""
+        verdict, _ = await self._await_human(ctx, kind, action, detail)
+        return verdict
 
     async def ask_human(self, ctx, question):
         _, response = await self._await_human(ctx, "question", question, "")
@@ -339,15 +349,16 @@ class Office:
         try:
             approved, response = await asyncio.wait_for(
                 future.wait(), config.APPROVAL_TIMEOUT_S)
+            verdict = Verdict("approved" if approved else "declined")
         except asyncio.TimeoutError:
             self.store.decide_approval(approval_id, "expired")
             self.bus.publish("approval.decided", agent_id=ctx.agent_id,
                              id=approval_id, status="expired")
-            approved, response = False, ""
+            verdict, response = Verdict("expired"), ""
         finally:
             self._approval_waiters.pop(approval_id, None)
             self._set_status(ctx.agent_id, "working", ctx.task_title[:60])
-        return approved, response
+        return verdict, response
 
     # -- worker loops ----------------------------------------------------
     async def _worker_loop(self, agent_id):
@@ -419,18 +430,30 @@ class Office:
         self._record_usage(role, turn)
 
         result = ctx.result or turn.text or "(no output)"
-        status = "failed" if turn.error else "done"
+        # Three outcomes, not two. `finish` was called: done, whatever the
+        # stop reason - the agent said it was finished. Otherwise a run cut
+        # off by max_turns or the budget is *partial*: the office's cap did
+        # its job, the text is whatever exists so far, and nobody gets
+        # summoned to the manager's office for it. Only an error is a failure.
+        if turn.error:
+            status = "failed"
+        elif not ctx.result and turn.stop in llm.PARTIAL_STOPS:
+            status = "partial"
+        else:
+            status = "done"
         # The office records what happened itself. Paying an agent to summarise
         # what the database already knows would be an absurd way to spend a turn.
         with contextlib.suppress(Exception):
             notebook.log_activity(
                 self.store,
                 f"**{role.name}** {status} — {ctx.task_title}"
-                + (f" ({turn.error.splitlines()[0][:70]})" if turn.error else ""))
+                + (f" ({turn.error.splitlines()[0][:70]})" if turn.error else
+                   f" (stopped: {turn.stop})" if status == "partial" else ""))
         self.store.update_task(task_id, status=status, result=result,
-                               error=turn.error or None, finished_at=time.time())
+                               error=turn.error or None, stop=turn.stop or None,
+                               finished_at=time.time())
         self.bus.publish("task.updated", agent_id=role.id, task_id=task_id,
-                         status=status, result=result[:400])
+                         status=status, stop=turn.stop, result=result[:400])
         if status == "failed":
             self._on_failure(role.id, task_id, turn.error)
 
@@ -474,9 +497,17 @@ class Office:
         turn = await self._run_model(request, ctx)
         self._record_usage(role, turn)
         # message_user is the manager's proper exit; fall back to raw text so a
-        # reply is never silently swallowed.
-        if not ctx.result and (turn.text or turn.error):
-            self._say_to_user(turn.error or turn.text)
+        # reply is never silently swallowed - and a reply cut short says so,
+        # rather than reading as a complete answer that happens to end oddly.
+        if not ctx.result:
+            text = turn.error or turn.text or ""
+            if turn.stop in llm.PARTIAL_STOPS and not turn.error:
+                why = {"max_turns": "turns", "budget_exhausted": "budget",
+                       "max_tokens": "room to reply"}.get(turn.stop, turn.stop)
+                text = (text + "\n\n" if text else "") + \
+                       f"(I ran out of {why} before finishing. Ask me to continue.)"
+            if text:
+                self._say_to_user(text)
 
     # -- helpers ---------------------------------------------------------
     def _say_to_user(self, text):
@@ -567,6 +598,17 @@ class Office:
                         log.info("pruned %s", removed)
             except Exception:
                 log.exception("ticker failed")
+
+
+class Verdict(str):
+    """What the human said to an approval: "approved", "declined" or
+    "expired". Truthy only when approved, so `if ok:` keeps working; the
+    string tells a tool which kind of no it got. An absent principal is not
+    an opposed one, and an agent told "declined" on a timeout would report
+    a refusal that never happened."""
+
+    def __bool__(self):
+        return str.__eq__(self, "approved")
 
 
 class _SafeFuture:

@@ -14,6 +14,7 @@ from typing import Any, Callable
 from . import config
 from .connectors import mail as mail_connector
 from .connectors import slack as slack_connector
+from .llm import truncate
 
 
 @dataclass
@@ -150,18 +151,42 @@ async def _assign(args, ctx):
     return f"assigned {task_id} to {assignee}"
 
 
+# BUDGET: each task's result is clipped on its own. One shared clip across
+# the lot meant that waiting on four tasks lost the middle two entirely, with
+# nothing in the output to say which - the opposite of what delegation is for.
+WAIT_RESULT_CHARS = 1200
+WAIT_ERROR_CHARS = 400
+
+
+def _wait_entry(task_id, row):
+    status = row.get("status") or "unknown"
+    stop = row.get("stop") or ""
+    label = status
+    if status == "partial" and stop:
+        label = f"partial - stopped at {stop.replace('_', ' ')}, not finished"
+    head = f"--- {task_id} [{label}] {row.get('title', '')}"
+    if status in ("queued", "running"):
+        return head + "\n(still running - wait again, or carry on without it)"
+    result = row.get("result") or ""
+    if result == "(no output)":
+        result = ""
+    parts = [truncate(result, WAIT_RESULT_CHARS)] if result else []
+    # The error is never hidden behind the result. `result or error` used to
+    # mean the manager saw "(no output)" and had to guess what went wrong.
+    if row.get("error"):
+        parts.append("ERROR: " + truncate(row["error"], WAIT_ERROR_CHARS))
+    if not parts:
+        parts.append("(no output)")
+    return head + "\n" + "\n".join(parts)
+
+
 async def _wait(args, ctx):
     raw = args.get("task_ids") or ""
     ids = [t.strip() for t in str(raw).replace(",", " ").split() if t.strip()]
     results = await ctx.office.wait_for(ids, requester=ctx.agent_id)
     if not results:
         return "nothing to wait for"
-    out = []
-    for task_id, row in results.items():
-        status = row.get("status")
-        body = row.get("result") or row.get("error") or ""
-        out.append(f"--- {task_id} [{status}] {row.get('title','')}\n{body}")
-    return "\n\n".join(out)
+    return "\n\n".join(_wait_entry(task_id, row) for task_id, row in results.items())
 
 
 async def _task_status(args, ctx):
@@ -309,6 +334,11 @@ async def _hire_employee(args, ctx):
     )
     ok = await ctx.request_approval("hire", summary, detail="Wren wants to hire")
     if not ok:
+        if ok == "expired":
+            return ("no decision on this hire within "
+                    f"{config.APPROVAL_TIMEOUT_S // 60} minutes - your principal was "
+                    "away, not opposed. Put the proposed role in your result so they "
+                    "can decide later; do not report it as refused.")
         return "your principal declined this hire. Ask what they would change."
 
     try:
@@ -438,6 +468,18 @@ def _within_workspace(path):
         return False
 
 
+def _deny_message(verdict, what):
+    """The two kinds of no read very differently to an agent. "Declined"
+    on a timeout had agents telling the principal that *they* had refused
+    something they never saw."""
+    if verdict == "expired":
+        return (f"No decision on this {what} within "
+                f"{config.APPROVAL_TIMEOUT_S // 60} minutes - your principal was away, "
+                f"not opposed. Do not treat it as refused: stop here and report "
+                f"exactly what you needed approved, so they can decide later.")
+    return f"Your principal declined this {what}."
+
+
 async def permission_gate(ctx, tool_name, input_data, _context):
     """Routed here by the Agent SDK whenever a call is not pre-approved.
 
@@ -457,7 +499,7 @@ async def permission_gate(ctx, tool_name, input_data, _context):
         ok = await ctx.request_approval("shell", command, detail=detail)
         if ok:
             return PermissionResultAllow(updated_input=input_data)
-        return PermissionResultDeny(message="Your principal declined this command.")
+        return PermissionResultDeny(message=_deny_message(ok, "command"))
 
     if tool_name in ("Write", "Edit", "NotebookEdit"):
         path = input_data.get("file_path") or input_data.get("path") or ""
@@ -468,10 +510,10 @@ async def permission_gate(ctx, tool_name, input_data, _context):
                                         detail=ctx.task_title)
         if ok:
             return PermissionResultAllow(updated_input=input_data)
-        return PermissionResultDeny(message="Writes outside the workspace are declined.")
+        return PermissionResultDeny(message=_deny_message(ok, "write outside the workspace"))
 
     ok = await ctx.request_approval("tool", f"{tool_name} {str(input_data)[:200]}",
                                     detail=ctx.task_title)
     if ok:
         return PermissionResultAllow(updated_input=input_data)
-    return PermissionResultDeny(message="Declined by your principal.")
+    return PermissionResultDeny(message=_deny_message(ok, "tool call"))

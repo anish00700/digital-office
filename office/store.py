@@ -134,6 +134,23 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
+def _drop_skill(db, name):
+    """Remove one skill grant (by bare name or plugin:name) from every roster
+    row that holds it. Used by a migration; safe to run twice."""
+    rows = db.execute("SELECT id, skills FROM roster").fetchall()
+    for row in rows:
+        try:
+            skills = list(json.loads(row["skills"] or "[]"))
+        except (TypeError, ValueError):
+            continue
+        kept = [sk for sk in skills
+                if sk != name and not str(sk).endswith(":" + name)
+                and not str(sk).startswith(name + ":")]
+        if kept != skills:
+            db.execute("UPDATE roster SET skills=? WHERE id=?",
+                       (json.dumps(kept), row["id"]))
+
+
 class Store:
     def __init__(self, path=None):
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -147,11 +164,21 @@ class Store:
             self._migrate()
             self.db.commit()
 
-    # Ordered, named, recorded in `settings` as migrated:<name>. Each step must
-    # be safe to re-run, because the settings row is written after the step.
+    # Ordered, named, recorded in `settings` as migrated:<name>. Each step is
+    # either an ALTER TABLE ... ADD COLUMN (skipped when the column exists) or
+    # a callable taking the connection. Every step must be safe to re-run,
+    # because the settings row is written after the step.
     MIGRATIONS = (
         ("roster.skills",
          "ALTER TABLE roster ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'"),
+        # Why a run ended - end_turn, max_turns, budget_exhausted, ... A task
+        # cut off by a cap used to be stored as done with half an answer.
+        ("tasks.stop", "ALTER TABLE tasks ADD COLUMN stop TEXT"),
+        # The manager's session-handoff skill widened the SDK's setting
+        # sources, which loaded the workspace CLAUDE.md - rewritten after
+        # every task - into every manager request. Offices seeded before the
+        # default changed still carry the grant in their roster row.
+        ("roster.no_session_handoff", lambda db: _drop_skill(db, "session-handoff")),
     )
 
     def _migrate(self):
@@ -159,14 +186,18 @@ class Store:
         already exists, so anything added after the first release needs this."""
         done = {r[0] for r in self.db.execute(
             "SELECT key FROM settings WHERE key LIKE 'migrated:%'")}
-        for name, sql in self.MIGRATIONS:
+        for name, step in self.MIGRATIONS:
             if f"migrated:{name}" in done:
                 continue
-            table = sql.split()[2]
-            column = sql.split("ADD COLUMN", 1)[1].split()[0] if "ADD COLUMN" in sql else None
-            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
-            if column is None or column not in have:
-                self.db.execute(sql)
+            if callable(step):
+                step(self.db)
+            else:
+                table = step.split()[2]
+                column = (step.split("ADD COLUMN", 1)[1].split()[0]
+                          if "ADD COLUMN" in step else None)
+                have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+                if column is None or column not in have:
+                    self.db.execute(step)
             self.db.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (f"migrated:{name}", str(time.time())))
@@ -557,7 +588,8 @@ class Store:
         rather than per model call."""
         rows = self._run(
             "SELECT assignee, COUNT(*) n FROM tasks"
-            " WHERE status='done' AND COALESCE(finished_at, created_at) >= ?"
+            " WHERE status IN ('done', 'partial')"
+            " AND COALESCE(finished_at, created_at) >= ?"
             " GROUP BY assignee", (since,), fetch="all") or []
         return {r["assignee"]: r["n"] for r in rows}
 
